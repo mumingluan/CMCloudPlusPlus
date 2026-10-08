@@ -1,0 +1,57 @@
+[package]
+name = "cmcloud"
+version = "0.1.6"
+description = "China Mobile Cloud third-party desktop and mobile client"
+authors = ["CMCloud++ Contributors"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/mumingluan/CMCloudPlusPlus"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "cmcloud_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-document-picker = { path = "tauri-plugin-document-picker" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["fs", "io-util", "time", "sync", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+rsa = "0.9"
+aes = "0.8"
+aes-gcm = "0.10"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+hex = "0.4"
+quick-xml = { version = "0.38", features = ["serialize"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CMCloud++",
+  "version": "0.1.6",
+  "identifier": "io.cmcloud.plus",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "CMCloud++ · 移动云盘",
+        "width": 1320,
+        "height": 880,
+        "minWidth": 840,
+        "minHeight": 600,
+        "backgroundColor": "#f3f5f9"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data: https: blob:; style-src 'self' 'unsafe-inline'; media-src https: blob:; object-src 'none'; frame-src 'none'; base-uri 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "shortDescription": "中国移动云盘第三方客户端",
+    "category": "Utility"
+  }
+}

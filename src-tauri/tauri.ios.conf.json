@@ -1,0 +1,4 @@
+{
+  "app": { "windows": [{ "title": "CMCloud++", "backgroundColor": "#f3f5f9" }] },
+  "bundle": { "targets": "all", "iOS": { "minimumSystemVersion": "14.0" } }
+}
