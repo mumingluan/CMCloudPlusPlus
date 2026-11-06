@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  ArrowLeft,
   Cloud,
   HardDrive,
   Info,
@@ -21,7 +20,6 @@ type Props = {
   quota: { used: number; total: number } | null;
   onConnected: (account: AccountSummary) => void;
   onLogout: () => Promise<void> | void;
-  onReturn: () => void;
   alert: (message: string, error?: boolean) => void;
   onRemovedCurrent?: () => void;
 };
@@ -31,7 +29,6 @@ export function AccountView({
   quota,
   onConnected,
   onLogout,
-  onReturn,
   alert,
   onRemovedCurrent,
 }: Props) {
@@ -204,10 +201,6 @@ export function AccountView({
     <section className="workspace account-workspace">
       <div className="page-heading">
         <h1>会话管理</h1>
-        <button className="button quiet" onClick={onReturn} disabled={!!busy}>
-          <ArrowLeft size={16} />
-          返回文件
-        </button>
       </div>
       <div className="account-content">
         <section className="saved-sessions" aria-label="已保存账号">

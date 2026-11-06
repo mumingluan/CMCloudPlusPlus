@@ -27,6 +27,8 @@ import {
   HardDrive,
   Info,
   Link,
+  LayoutGrid,
+  List,
   ListFilter,
   Loader2,
   MoreHorizontal,
@@ -38,7 +40,6 @@ import {
   Search,
   Settings,
   ShieldCheck,
-  SlidersHorizontal,
   Trash2,
   Upload,
   UserRound,
@@ -63,6 +64,9 @@ import { dateText, fileKind, formatBytes, sortFiles, validName, previewSources }
 import { applyTheme, readPreference, savePreference } from './appearance';
 import type { Theme } from './appearance';
 import { AccountView } from './AccountView';
+import { FileContextMenu } from './FileContextMenu';
+import type { FileMenuItem } from './FileContextMenu';
+import { useFileDragSelection } from './useFileDragSelection';
 import type { AccountSummary, CloudFile, TransferJob } from './types';
 import { scalePreview } from './preview';
 
@@ -127,7 +131,6 @@ function App() {
     const value = readPreference('cmcloud.theme', 'system');
     return ['system', 'light', 'dark'].includes(value) ? (value as Theme) : 'system';
   });
-  const [hashPolicy, setHashPolicy] = useState<'default' | 'once' | 'session'>('default');
   useEffect(() => {
     applyTheme(theme);
     savePreference('cmcloud.theme', theme);
@@ -147,9 +150,6 @@ function App() {
   }, [theme]);
   const [route, setRoute] = useState<Route>('files');
   const [account, setAccount] = useState<AccountSummary | null>(preview?.account ?? null);
-  useEffect(() => {
-    setHashPolicy('default');
-  }, [account?.id]);
   const [trail, setTrail] = useState<CloudFile[]>([rootFile()]);
   const [files, setFiles] = useState<CloudFile[]>(preview?.files ?? []);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -160,14 +160,28 @@ function App() {
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query);
   const [selection, setSelection] = useState<Set<string>>(new Set());
-  const [detail, setDetail] = useState<CloudFile | null>(null);
   const [sort, setSort] = useState({ key: 'name', desc: false });
   const [filter, setFilter] = useState('all');
   const [jobs, setJobs] = useState<TransferJob[]>(preview?.jobs ?? []);
   const [quota, setQuota] = useState<{ used: number; total: number } | null>(null);
   const [prompt, setPrompt] = useState<Prompt | null>(null);
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
-  const [compact, setCompact] = useState(false);
+  const [view, setView] = useState<'list' | 'grid'>(() =>
+    readPreference('cmcloud.fileView', 'list') === 'grid' ? 'grid' : 'list',
+  );
+  const [smallScreen, setSmallScreen] = useState(
+    () => mobile || (typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches),
+  );
+  const compact = !(
+    mobile ||
+    /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  );
+  const [gridColumns, setGridColumns] = useState(1);
+  const [fileMenu, setFileMenu] = useState<{ x: number; y: number; files: CloudFile[] } | null>(
+    null,
+  );
+  const closeFileMenu = useCallback(() => setFileMenu(null), []);
   const [jobFilter, setJobFilter] = useState('active');
   const [jobOffset, setJobOffset] = useState(0);
   const [jobSummary, setJobSummary] = useState<{ status: string; count: number }[]>([]);
@@ -200,13 +214,63 @@ function App() {
       ),
     [files, deferredQuery, filter, sort],
   );
+  const columns = view === 'grid' ? gridColumns : 1;
+  const rowHeight = view === 'grid' ? 152 : compact ? 48 : 64;
   const virtual = useVirtualizer({
-    count: visible.length,
+    count: Math.ceil(visible.length / columns),
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => (compact ? 48 : 64),
+    estimateSize: () => rowHeight,
     overscan: 12,
-    getItemKey: (i) => visible[i].id,
+    getItemKey: (i) => visible[i * columns].id,
   });
+  const dragSelection = useFileDragSelection({
+    scrollRef,
+    files: visible,
+    columns,
+    rowHeight,
+    selection,
+    onSelection: setSelection,
+    resetKey: `${directoryKey}/${route}/${view}`,
+  });
+  useEffect(() => {
+    const preventMenu = (event: MouseEvent) => event.preventDefault();
+    document.addEventListener('contextmenu', preventMenu);
+    const media = typeof matchMedia === 'function' ? matchMedia('(max-width: 700px)') : null;
+    const resize = () => setSmallScreen(mobile || !!media?.matches);
+    media?.addEventListener('change', resize);
+    return () => {
+      document.removeEventListener('contextmenu', preventMenu);
+      media?.removeEventListener('change', resize);
+    };
+  }, []);
+  useEffect(() => {
+    savePreference('cmcloud.fileView', view);
+    virtual.measure();
+  }, [view, rowHeight, columns]);
+  useEffect(() => {
+    const area = scrollRef.current;
+    if (!area) return;
+    const resize = () =>
+      setGridColumns(Math.max(1, Math.floor(area.clientWidth / (smallScreen ? 128 : 152))));
+    resize();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', resize);
+      return () => window.removeEventListener('resize', resize);
+    }
+    const observer = new ResizeObserver(resize);
+    observer.observe(area);
+    return () => observer.disconnect();
+  }, [route, account?.id, smallScreen]);
+  useEffect(closeFileMenu, [
+    directoryKey,
+    route,
+    view,
+    deferredQuery,
+    filter,
+    sort,
+    files,
+    closeFileMenu,
+  ]);
   const alert = useCallback((text: string, error = false) => setNotice({ text, error }), []);
   useEffect(() => {
     if (!notice) return;
@@ -360,7 +424,6 @@ function App() {
     setTrail([rootFile(value.rootId)]);
     setFiles([]);
     setSelection(new Set());
-    setDetail(null);
     setRoute(value.space === 'share' ? 'shares' : 'files');
     setHasMore(false);
     setCursor(null);
@@ -450,7 +513,6 @@ function App() {
     generation.current++;
     setFiles([]);
     setSelection(new Set());
-    setDetail(null);
     setHasMore(false);
     setTrail([...trail, file]);
   };
@@ -458,7 +520,6 @@ function App() {
     generation.current++;
     setFiles([]);
     setSelection(new Set());
-    setDetail(null);
     setHasMore(false);
     setTrail(trail.slice(0, index + 1));
   };
@@ -495,23 +556,17 @@ function App() {
     });
   const upload = () =>
     void run(async () => {
-      if (account?.space === 'personal_new' && hashPolicy !== 'default')
-        alert('个人空间接口要求 SHA256，本次仍将计算哈希');
-      const results = await api.upload(parent, hashPolicy !== 'default');
+      const results = await api.upload(parent);
       if (results.length) {
-        if (hashPolicy === 'once') setHashPolicy('default');
         setJobs((prev) => [...results, ...prev].slice(0, 200));
         alert(`${results.length} 个文件已加入上传队列`);
       }
     });
   const uploadFolder = () =>
     void run(async () => {
-      if (account?.space === 'personal_new' && hashPolicy !== 'default')
-        alert('个人空间接口要求 SHA256，本次仍将计算哈希');
       setScan({ queued: 0, path: '选择并扫描文件夹' });
       try {
-        const result = await api.uploadDirectory(parent, hashPolicy !== 'default');
-        if (result.queued && hashPolicy === 'once') setHashPolicy('default');
+        const result = await api.uploadDirectory(parent);
         if (result.queued)
           alert(
             `${result.queued.toLocaleString()} 个文件已加入上传队列${result.skipped ? `，跳过 ${result.skipped} 个特殊文件` : ''}`,
@@ -546,6 +601,63 @@ function App() {
         .reduce((count, j) => count + j.count, 0)
     : jobs.length;
   const readOnly = account?.space === 'share';
+  const openFile = (file: CloudFile) => {
+    if (file.isDir) openFolder(file);
+    else if (fileKind(file) === '视频') setPreviewFile(file);
+    else void run(async () => openUrl(await api.link(file)));
+  };
+  const openFileMenu = (file: CloudFile, x: number, y: number) => {
+    if (busy) return;
+    const targets = selection.has(file.id) ? selected : [file];
+    if (!selection.has(file.id)) setSelection(new Set([file.id]));
+    setFileMenu({ x, y, files: targets });
+  };
+  const menuItems: FileMenuItem[] = [];
+  if (fileMenu) {
+    const targets = fileMenu.files;
+    const single = targets.length === 1 ? targets[0] : null;
+    if (single)
+      menuItems.push({
+        label: single.isDir
+          ? '打开文件夹'
+          : fileKind(single) === '视频'
+            ? '视频预览'
+            : ['图片', '音频', 'PDF'].includes(fileKind(single))
+              ? '打开预览'
+              : '打开文件',
+        icon: single.isDir ? Folder : ExternalLink,
+        action: () => openFile(single),
+      });
+    menuItems.push({ label: '下载', icon: Download, action: () => download(targets) });
+    if (single && !single.isDir)
+      menuItems.push({
+        label: '复制下载链接',
+        icon: Link,
+        action: () => showLink(single),
+      });
+    if (!readOnly) {
+      if (single)
+        menuItems.push({
+          label: '重命名',
+          icon: FileText,
+          action: () => setPrompt({ kind: 'rename', files: targets }),
+        });
+      menuItems.push(
+        {
+          label: '移动到',
+          icon: FolderInput,
+          action: () => setPrompt({ kind: 'move', files: targets }),
+        },
+        { label: '复制到', icon: Copy, action: () => setPrompt({ kind: 'copy', files: targets }) },
+        {
+          label: '删除',
+          icon: Trash2,
+          danger: true,
+          action: () => setPrompt({ kind: 'delete', files: targets }),
+        },
+      );
+    }
+  }
   const nav: { route: Route; label: string; icon: LucideIcon }[] = [
     { route: 'files', label: '我的文件', icon: Folder },
     { route: 'transfers', label: '传输列表', icon: ArrowDownToLine },
@@ -632,12 +744,10 @@ function App() {
               setAccount(null);
               setFiles([]);
               setSelection(new Set());
-              setDetail(null);
               setQuota(null);
               setTrail([rootFile()]);
             }}
             quota={quota}
-            onReturn={() => setRoute('files')}
             onLogout={() =>
               run(async () => {
                 await api.logout();
@@ -662,7 +772,6 @@ function App() {
             <div className="page-heading">
               <div>
                 <h1>传输列表</h1>
-                <p>每一次传输，都有清晰的进度。</p>
               </div>
               <button
                 className="button secondary"
@@ -676,36 +785,6 @@ function App() {
                 <Trash2 size={16} />
                 清理完成记录
               </button>
-            </div>
-            <div className="transfer-upload-policy">
-              <div className="transfer-policy-label">
-                <span id="upload-hash-label">上传前哈希</span>
-                <p id="upload-hash-help">仅影响新上传任务；个人空间仍需计算 SHA256。</p>
-              </div>
-              <div
-                className="tabs"
-                role="group"
-                aria-labelledby="upload-hash-label"
-                aria-describedby="upload-hash-help"
-              >
-                {(
-                  [
-                    ['default', '按设置'],
-                    ['once', '单次跳过'],
-                    ['session', '本会话跳过'],
-                  ] as const
-                ).map(([value, text]) => (
-                  <button
-                    key={value}
-                    className={hashPolicy === value ? 'selected' : ''}
-                    aria-pressed={hashPolicy === value}
-                    disabled={busy}
-                    onClick={() => setHashPolicy(value)}
-                  >
-                    {text}
-                  </button>
-                ))}
-              </div>
             </div>
             <div className="transfer-toolbar">
               <div className="tabs">
@@ -804,12 +883,6 @@ function App() {
                     添加分享
                   </button>
                 )}
-                {account && !readOnly && route === 'files' && (
-                  <button className="button primary" disabled={busy} onClick={upload}>
-                    <Upload size={17} />
-                    上传文件
-                  </button>
-                )}
               </div>
             </div>
             {!account || (route === 'shares' && !readOnly) ? (
@@ -874,6 +947,12 @@ function App() {
                       </>
                     ) : (
                       <>
+                        {!readOnly && (
+                          <button className="button primary" disabled={busy} onClick={upload}>
+                            <Upload size={17} />
+                            上传文件
+                          </button>
+                        )}
                         {!readOnly && (
                           <button
                             className="button secondary"
@@ -978,19 +1057,19 @@ function App() {
                     </label>
                     <button
                       className="icon-button"
-                      aria-label={compact ? '切换舒适列表' : '切换紧凑列表'}
-                      aria-pressed={compact}
+                      aria-label={view === 'list' ? '切换图标模式' : '切换列表模式'}
+                      title={view === 'list' ? '切换图标模式' : '切换列表模式'}
+                      aria-pressed={view === 'grid'}
                       onClick={() => {
-                        setCompact(!compact);
-                        virtual.measure();
+                        setView(view === 'list' ? 'grid' : 'list');
                       }}
                     >
-                      <SlidersHorizontal size={17} />
+                      {view === 'list' ? <LayoutGrid size={17} /> : <List size={17} />}
                     </button>
                   </div>
                 </div>
-                <div className={`files-area ${detail ? 'with-detail' : ''}`}>
-                  <div className="file-table">
+                <div className="files-area">
+                  <div className={`file-table ${view === 'grid' ? 'icon-view' : 'list-view'}`}>
                     <div className="table-head">
                       <label className="checkbox-wrap">
                         <input
@@ -1023,7 +1102,7 @@ function App() {
                       ))}
                       <span className="col-menu" />
                     </div>
-                    <div className="file-scroll" ref={scrollRef}>
+                    <div className="file-scroll" ref={scrollRef} {...dragSelection.handlers}>
                       {loadError ? (
                         <div className="load-error">
                           <Info size={24} />
@@ -1064,52 +1143,133 @@ function App() {
                         </div>
                       ) : (
                         <div className="virtual-body" style={{ height: virtual.getTotalSize() }}>
-                          {virtual.getVirtualItems().map((row) => {
-                            const file = visible[row.index];
-                            return (
-                              <div
-                                key={row.key}
-                                className={`file-row ${selection.has(file.id) ? 'selected' : ''} ${detail?.id === file.id ? 'focused' : ''} ${compact ? 'compact' : ''}`}
-                                style={{
-                                  height: row.size,
-                                  transform: `translateY(${row.start}px)`,
-                                }}
-                                onDoubleClick={() =>
-                                  file.isDir ? openFolder(file) : setDetail(file)
-                                }
-                              >
-                                <label className="checkbox-wrap">
-                                  <input
-                                    type="checkbox"
-                                    aria-label={`选择 ${file.name}`}
-                                    checked={selection.has(file.id)}
-                                    onChange={() => toggle(file)}
-                                  />
-                                </label>
-                                <button
-                                  className="file-name"
-                                  onClick={() => (file.isDir ? openFolder(file) : setDetail(file))}
-                                >
-                                  <FileGlyph file={file} />
-                                  <span>
-                                    <strong>{file.name}</strong>
-                                    <small>{fileKind(file)}</small>
-                                  </span>
-                                </button>
-                                <span className="col-size">
-                                  {file.isDir ? '—' : formatBytes(file.size)}
-                                </span>
-                                <span className="col-modifiedAt">{dateText(file.modifiedAt)}</span>
-                                <button
-                                  className="icon-button row-more"
-                                  aria-label={`查看 ${file.name} 详情`}
-                                  onClick={() => setDetail(file)}
-                                >
-                                  <MoreHorizontal size={19} />
-                                </button>
-                              </div>
-                            );
-                          })}
+                          {virtual.getVirtualItems().flatMap((row) =>
+                            visible
+                              .slice(row.index * columns, (row.index + 1) * columns)
+                              .map((file, column) => {
+                                return (
+                                  <div
+                                    key={file.id}
+                                    tabIndex={0}
+                                    aria-label={file.name}
+                                    className={`file-row ${selection.has(file.id) ? 'selected' : ''} ${compact ? 'compact' : ''} ${view === 'grid' ? 'file-card' : ''}`}
+                                    style={{
+                                      height: rowHeight,
+                                      transform: `translateY(${row.start}px)`,
+                                      ...(view === 'grid'
+                                        ? {
+                                            left: `${(column * 100) / columns}%`,
+                                            width: `${100 / columns}%`,
+                                            right: 'auto',
+                                          }
+                                        : {}),
+                                    }}
+                                    onContextMenu={(event) => {
+                                      event.preventDefault();
+                                      event.currentTarget.focus();
+                                      openFileMenu(file, event.clientX, event.clientY);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (
+                                        event.key === 'ContextMenu' ||
+                                        (event.shiftKey && event.key === 'F10')
+                                      ) {
+                                        event.preventDefault();
+                                        const bounds = event.currentTarget.getBoundingClientRect();
+                                        openFileMenu(file, bounds.left + 24, bounds.top + 24);
+                                      } else if (
+                                        event.target === event.currentTarget &&
+                                        event.key === ' '
+                                      ) {
+                                        event.preventDefault();
+                                        toggle(file);
+                                      } else if (
+                                        event.target === event.currentTarget &&
+                                        event.key === 'Enter'
+                                      ) {
+                                        openFile(file);
+                                      }
+                                    }}
+                                    onDoubleClick={(event) => {
+                                      if (
+                                        !(event.target as HTMLElement).closest(
+                                          '.checkbox-wrap, .row-more',
+                                        )
+                                      )
+                                        openFile(file);
+                                    }}
+                                  >
+                                    <label className="checkbox-wrap">
+                                      <input
+                                        type="checkbox"
+                                        aria-label={`选择 ${file.name}`}
+                                        checked={selection.has(file.id)}
+                                        onChange={() => toggle(file)}
+                                      />
+                                    </label>
+                                    <button
+                                      className="file-name"
+                                      title={file.name}
+                                      onClick={(event) => {
+                                        if (
+                                          file.isDir &&
+                                          !event.ctrlKey &&
+                                          !event.metaKey &&
+                                          !event.shiftKey
+                                        )
+                                          openFolder(file);
+                                        else if (event.ctrlKey || event.metaKey || event.shiftKey)
+                                          toggle(file);
+                                        else setSelection(new Set([file.id]));
+                                      }}
+                                    >
+                                      {view === 'grid' && file.thumbnail ? (
+                                        <span className="file-artwork">
+                                          <img
+                                            className="file-thumbnail"
+                                            src={file.thumbnail}
+                                            alt=""
+                                            loading="lazy"
+                                            draggable={false}
+                                            onError={(event) => {
+                                              event.currentTarget.hidden = true;
+                                            }}
+                                          />
+                                          <FileGlyph file={file} size={42} />
+                                        </span>
+                                      ) : (
+                                        <FileGlyph file={file} size={view === 'grid' ? 42 : 22} />
+                                      )}
+                                      <span>
+                                        <strong>{file.name}</strong>
+                                        <small>{fileKind(file)}</small>
+                                      </span>
+                                    </button>
+                                    <span className="col-size">
+                                      {file.isDir ? '—' : formatBytes(file.size)}
+                                    </span>
+                                    <span className="col-modifiedAt">
+                                      {dateText(file.modifiedAt)}
+                                    </span>
+                                    <button
+                                      className="icon-button row-more"
+                                      aria-label={`${file.name} 操作菜单`}
+                                      aria-haspopup="menu"
+                                      disabled={busy}
+                                      onClick={(event) => {
+                                        const bounds = event.currentTarget.getBoundingClientRect();
+                                        openFileMenu(file, bounds.right, bounds.bottom);
+                                      }}
+                                    >
+                                      <MoreHorizontal size={19} />
+                                    </button>
+                                  </div>
+                                );
+                              }),
+                          )}
+                          {dragSelection.box && (
+                            <div className="file-selection-box" style={dragSelection.box} />
+                          )}
                         </div>
                       )}
                       {hasMore && (
@@ -1137,106 +1297,12 @@ function App() {
                       <span>
                         {selection.size
                           ? `已选 ${selection.size} 项 · ${formatBytes(selected.reduce((sum, f) => sum + f.size, 0))}`
-                          : '按名称排序 · 文件夹优先'}
+                          : !compact
+                            ? '从复选框滑动多选'
+                            : '拖动框选 · Ctrl 追加选择'}
                       </span>
                     </footer>
                   </div>
-                  {detail && (
-                    <aside className="detail-panel">
-                      <div className="detail-top">
-                        <h2>文件详情</h2>
-                        <button
-                          className="icon-button"
-                          aria-label="关闭文件详情"
-                          onClick={() => setDetail(null)}
-                        >
-                          <X size={18} />
-                        </button>
-                      </div>
-                      <div className="detail-preview">
-                        {detail.thumbnail ? (
-                          <img src={detail.thumbnail} alt={detail.name} />
-                        ) : (
-                          <FileGlyph file={detail} size={62} />
-                        )}
-                      </div>
-                      <h3>{detail.name}</h3>
-                      <dl>
-                        <div>
-                          <dt>类型</dt>
-                          <dd>{fileKind(detail)}</dd>
-                        </div>
-                        <div>
-                          <dt>大小</dt>
-                          <dd>{detail.isDir ? '—' : formatBytes(detail.size)}</dd>
-                        </div>
-                        <div>
-                          <dt>修改时间</dt>
-                          <dd>{dateText(detail.modifiedAt)}</dd>
-                        </div>
-                        <div>
-                          <dt>位置</dt>
-                          <dd>{parent.name}</dd>
-                        </div>
-                      </dl>
-                      <div className="detail-actions">
-                        {detail.isDir ? (
-                          <button className="button primary" onClick={() => openFolder(detail)}>
-                            <Folder size={16} />
-                            打开文件夹
-                          </button>
-                        ) : (
-                          <>
-                            <button className="button primary" onClick={() => download([detail])}>
-                              <Download size={16} />
-                              下载文件
-                            </button>
-                            <button className="button secondary" onClick={() => showLink(detail)}>
-                              <Copy size={16} />
-                              复制下载链接
-                            </button>
-                            {fileKind(detail) === '视频' && (
-                              <button
-                                className="button secondary"
-                                onClick={() => setPreviewFile(detail)}
-                              >
-                                <Play size={16} />
-                                视频预览
-                              </button>
-                            )}
-                            {['图片', '音频', 'PDF'].includes(fileKind(detail)) && (
-                              <button
-                                className="button secondary"
-                                onClick={() =>
-                                  void run(async () => openUrl(await api.link(detail)))
-                                }
-                              >
-                                <ExternalLink size={16} />
-                                打开预览
-                              </button>
-                            )}
-                          </>
-                        )}
-                        {!readOnly && (
-                          <>
-                            <button
-                              className="button secondary"
-                              onClick={() => setPrompt({ kind: 'rename', files: [detail] })}
-                            >
-                              重命名
-                            </button>
-                            <button
-                              className="button quiet danger"
-                              onClick={() => setPrompt({ kind: 'delete', files: [detail] })}
-                            >
-                              <Trash2 size={16} />
-                              删除
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </aside>
-                  )}
                 </div>
               </>
             )}
@@ -1244,6 +1310,9 @@ function App() {
         )}
       </div>
 
+      {fileMenu && (
+        <FileContextMenu x={fileMenu.x} y={fileMenu.y} items={menuItems} onClose={closeFileMenu} />
+      )}
       {notice && (
         <div
           className={`toast ${notice.error ? 'error' : ''}`}
@@ -1281,9 +1350,6 @@ function App() {
             setSelection(
               (previous) => new Set([...previous].filter((id) => !removedFiles.current.has(id))),
             );
-            setDetail((previous) =>
-              previous && !removedFiles.current.has(previous.id) ? previous : null,
-            );
             refresh(true);
           }}
           onDone={(name) => {
@@ -1302,7 +1368,6 @@ function App() {
             }
             setPrompt(null);
             setSelection(new Set());
-            setDetail(null);
             if (prompt.kind !== 'delete') refresh(true);
           }}
           alert={alert}
@@ -1717,19 +1782,15 @@ function SettingsView({
   const [partSize, setPartSize] = useState(0);
   const [large, setLarge] = useState(false);
   const [real, setReal] = useState(true);
-  const [old, setOld] = useState(false);
-  const [skipHash, setSkipHash] = useState(false);
   useEffect(() => {
     if (!native) return;
     void api
       .options()
       .then((options) => {
         setConcurrency(options.concurrency);
-        setSkipHash(options.skipUploadHash);
         setPartSize(options.customUploadPartSize);
         setReal(options.reportRealSize);
         setLarge(options.useLargeThumbnail);
-        setOld(options.useOldStreamUpload);
         setSaved(true);
       })
       .catch(() => {});
@@ -1739,7 +1800,6 @@ function SettingsView({
       <div className="page-heading">
         <div>
           <h1>设置</h1>
-          <p>让云盘按你的节奏工作。</p>
         </div>
       </div>
       <div className="settings-panel">
@@ -1760,12 +1820,6 @@ function SettingsView({
           </select>
         </div>
         <h2>传输</h2>
-        <Toggle
-          title="上传前计算文件哈希"
-          description="用于秒传。关闭后群组使用流式上传；个人空间接口强制要求 SHA256，仍会计算。对之后添加的任务生效。"
-          value={!skipHash}
-          onChange={(value) => setSkipHash(!value)}
-        />
         <div className="setting-row">
           <div>
             <h3>同时传输任务</h3>
@@ -1812,12 +1866,6 @@ function SettingsView({
           value={real}
           onChange={setReal}
         />
-        <Toggle
-          title="旧版流式上传"
-          description="群组的流式上传接口，不需要预先计算哈希，不支持秒传。"
-          value={old}
-          onChange={setOld}
-        />
         <h2>文件浏览</h2>
         <Toggle
           title="使用大尺寸缩略图"
@@ -1832,14 +1880,12 @@ function SettingsView({
             onClick={() =>
               void run(async () => {
                 await api.settings(concurrency);
-                await api.setSkipHash(skipHash);
                 if (account)
                   onAccount(
                     await api.updateOptions({
                       customUploadPartSize: partSize,
                       reportRealSize: real,
                       useLargeThumbnail: large,
-                      useOldStreamUpload: old,
                     }),
                   );
               }, '设置已保存')

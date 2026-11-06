@@ -20,7 +20,6 @@ export const api = {
   accounts: () => call<AccountSummary[]>('list_accounts'),
   selectAccount: (id: string) => call<AccountSummary>('select_account', { id }),
   removeAccount: (id: string) => call<void>('remove_account', { id }),
-  setSkipHash: (skip: boolean) => call<void>('set_skip_upload_hash', { skip }),
   official: () => call<Record<string, unknown>>('discover_official'),
   importOfficial: () => call<AccountSummary>('import_official'),
   switchSpace: (space: Space, cloudId: string, linkId: string) =>
@@ -39,10 +38,10 @@ export const api = {
   preview: (file: CloudFile) => call<unknown>('get_preview', { file }),
   download: (files: CloudFile[]) =>
     call<RawJob[]>('queue_downloads', { files }).then((jobs) => jobs.map(normalizeJob)),
-  upload: (parent: CloudFile, skipHash = false) =>
-    call<RawJob[]>('queue_uploads', { parent, skipHash }).then((jobs) => jobs.map(normalizeJob)),
-  uploadDirectory: (parent: CloudFile, skipHash = false) =>
-    call<{ queued: number; skipped: number }>('queue_upload_directory', { parent, skipHash }),
+  upload: (parent: CloudFile) =>
+    call<RawJob[]>('queue_uploads', { parent }).then((jobs) => jobs.map(normalizeJob)),
+  uploadDirectory: (parent: CloudFile) =>
+    call<{ queued: number; skipped: number }>('queue_upload_directory', { parent }),
   cancelScan: () => call<void>('cancel_scan'),
   enqueue: (specs: TransferSpec[]) =>
     call<RawJob[]>('queue_transfers', { specs }).then((jobs) => jobs.map(normalizeJob)),
@@ -57,11 +56,9 @@ export const api = {
   options: () =>
     call<{
       concurrency: number;
-      skipUploadHash: boolean;
       customUploadPartSize: number;
       reportRealSize: boolean;
       useLargeThumbnail: boolean;
-      useOldStreamUpload: boolean;
     }>('get_options'),
   foreground: () => call<ForegroundStatus>('get_foreground_status'),
   openCompleted: (id: string, reveal = false) =>

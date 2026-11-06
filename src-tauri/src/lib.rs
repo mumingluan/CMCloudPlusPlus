@@ -279,14 +279,7 @@ async fn update_options(
     if let Some(value) = config["useLargeThumbnail"].as_bool() {
         updated.use_large_thumbnail = value;
     }
-    if let Some(value) = config["useOldStreamUpload"].as_bool() {
-        updated.use_old_stream_upload = value;
-    }
     connect(&state, updated).await
-}
-#[tauri::command]
-async fn set_skip_upload_hash(state: State<'_, AppState>, skip: bool) -> Result<(), String> {
-    state.store.save_skip_hash(skip)
 }
 #[tauri::command]
 async fn get_options(state: State<'_, AppState>) -> Result<Value, String> {
@@ -295,7 +288,7 @@ async fn get_options(state: State<'_, AppState>) -> Result<Value, String> {
         None => AccountConfig::default(),
     };
     Ok(
-        serde_json::json!({"concurrency":state.transfers.concurrency(),"skipUploadHash":state.store.skip_hash()?,"customUploadPartSize":config.custom_upload_part_size,"reportRealSize":config.report_real_size,"useLargeThumbnail":config.use_large_thumbnail,"useOldStreamUpload":config.use_old_stream_upload}),
+        serde_json::json!({"concurrency":state.transfers.concurrency(),"customUploadPartSize":config.custom_upload_part_size,"reportRealSize":config.report_real_size,"useLargeThumbnail":config.use_large_thumbnail}),
     )
 }
 #[tauri::command]
@@ -483,15 +476,9 @@ async fn relocate_files(
 #[tauri::command]
 async fn queue_transfers(
     state: State<'_, AppState>,
-    mut specs: Vec<TransferSpec>,
+    specs: Vec<TransferSpec>,
 ) -> Result<Vec<TransferJob>, String> {
     let _session = state.session.lock().await;
-    let skip = state.store.skip_hash()?;
-    for spec in &mut specs {
-        if spec.direction == TransferDirection::Upload {
-            spec.skip_hash |= skip;
-        }
-    }
     state.transfers.enqueue(specs).await
 }
 #[tauri::command]
@@ -499,10 +486,8 @@ async fn queue_uploads(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     parent: CloudFile,
-    skip_hash: Option<bool>,
 ) -> Result<Vec<TransferJob>, String> {
     let _session = state.session.lock().await;
-    let skip_hash = skip_hash.unwrap_or(false) || state.store.skip_hash()?;
     #[cfg(target_os = "android")]
     {
         let documents = app.document_picker().pick_files().await?;
@@ -510,7 +495,6 @@ async fn queue_uploads(
             .into_iter()
             .map(|document| TransferSpec {
                 direction: TransferDirection::Upload,
-                skip_hash: skip_hash,
                 remote: parent.clone(),
                 local_path: document.path,
                 name: Some(document.name),
@@ -535,7 +519,6 @@ async fn queue_uploads(
             .into_iter()
             .map(|path| TransferSpec {
                 direction: TransferDirection::Upload,
-                skip_hash: skip_hash,
                 remote: parent.clone(),
                 local_path: path.to_string(),
                 name: None,
@@ -664,7 +647,6 @@ async fn enqueue_download_tree(
         } else {
             batch.push(TransferSpec {
                 direction: TransferDirection::Download,
-                skip_hash: false,
                 remote: file,
                 local_path: target.to_string_lossy().into_owned(),
                 name: None,
@@ -744,10 +726,8 @@ async fn queue_upload_directory(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     parent: CloudFile,
-    skip_hash: Option<bool>,
 ) -> Result<UploadScanResult, String> {
     let _session = state.session.lock().await;
-    let skip_hash = skip_hash.unwrap_or(false) || state.store.skip_hash()?;
     let _scan = state
         .scan
         .try_lock()
@@ -810,7 +790,6 @@ async fn queue_upload_directory(
                     } else {
                         batch.push(TransferSpec {
                             direction: TransferDirection::Upload,
-                            skip_hash: skip_hash,
                             remote: remote.clone(),
                             local_path: entry.path,
                             name: Some(entry.name),
@@ -882,7 +861,6 @@ async fn queue_upload_directory(
                 } else if kind.is_file() {
                     batch.push(TransferSpec {
                         direction: TransferDirection::Upload,
-                        skip_hash: skip_hash,
                         remote: remote.clone(),
                         local_path: entry.path().to_string_lossy().into_owned(),
                         name: Some(name),
@@ -989,7 +967,6 @@ pub fn run() {
             list_accounts,
             select_account,
             remove_account,
-            set_skip_upload_hash,
             get_account,
             disconnect_account,
             discover_official,

@@ -38,7 +38,6 @@ pub struct AccountConfig {
     pub custom_upload_part_size: u64,
     pub report_real_size: bool,
     pub use_large_thumbnail: bool,
-    pub use_old_stream_upload: bool,
 }
 impl Default for AccountConfig {
     fn default() -> Self {
@@ -58,7 +57,6 @@ impl Default for AccountConfig {
             custom_upload_part_size: 0,
             report_real_size: true,
             use_large_thumbnail: false,
-            use_old_stream_upload: false,
         }
     }
 }
@@ -110,10 +108,7 @@ pub struct UploadPlan {
     pub parts: Vec<UploadPart>,
     pub rapid: bool,
     pub existing: bool,
-    pub legacy: bool,
-    pub legacy_task_id: Option<String>,
     pub content_hash: String,
-    pub legacy_url: Option<String>,
     pub group_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -979,6 +974,9 @@ impl CloudClient {
         size: u64,
         sha256: &str,
     ) -> Result<UploadPlan, String> {
+        if sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err("上传需要完整文件的 SHA256 校验值".into());
+        }
         validate_name(name)?;
         if !parent.is_dir {
             return Err("上传目标需要为文件夹".into());
@@ -1002,50 +1000,6 @@ impl CloudClient {
             return Err("上传分片过多，请增大分片大小".into());
         }
         let dynamic = cfg.space == "group";
-        let legacy = dynamic && (cfg.use_old_stream_upload || sha256.is_empty());
-        if legacy {
-            let report = if cfg.report_real_size { size } else { 0 };
-            let mut path = self.dir_path(parent).await;
-            if parent.id == cfg.root_id {
-                path = "0".into();
-            }
-            let body = self.group_common(json!({"fileCount":1,"manualRename":2,"operation":0,"path":path,"seqNo":nonce(32),"totalSize":report,"uploadContentList":[{"contentName":name,"contentSize":report}]})).await?;
-            let value = self
-                .legacy_post(
-                    "/orchestration/familyCloud-rebuild/content/v1.0/getFileUploadURL",
-                    &body,
-                )
-                .await?;
-            let data = &value["data"]["uploadResult"];
-            let url = valid_download_url(string(data, "redirectionUrl"))?;
-            let task = string(data, "uploadTaskID");
-            if task.is_empty() {
-                return Err("上传未返回任务标识".into());
-            }
-            let mut plan = UploadPlan {
-                file_id: array(data, "newContentIDList")
-                    .first()
-                    .map(|v| string(v, "contentID"))
-                    .unwrap_or_default(),
-                upload_id: task.clone(),
-                name: name.into(),
-                size,
-                part_size,
-                parts: vec![],
-                rapid: false,
-                existing: false,
-                legacy: true,
-                legacy_task_id: Some(task),
-                content_hash: String::new(),
-                legacy_url: Some(url),
-                group_id: dynamic.then(|| cfg.cloud_id),
-            };
-            plan.parts = build_upload_parts(&plan, 1, count.min(100) as usize)?;
-            return Ok(plan);
-        }
-        if sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err("上传需要完整文件的 SHA256 校验值".into());
-        }
         if dynamic && cfg.cloud_id.is_empty() {
             return Err("群组上传需要 cloudId".into());
         }
@@ -1085,9 +1039,6 @@ impl CloudClient {
         start_number: u64,
         count: usize,
     ) -> Result<Vec<UploadPart>, String> {
-        if plan.legacy {
-            return build_upload_parts(plan, start_number, count.min(100));
-        }
         let total = plan.size.max(1).div_ceil(plan.part_size);
         if start_number == 0 || start_number > total {
             return Err("上传分片序号无效".into());
@@ -1113,73 +1064,25 @@ impl CloudClient {
             .await?;
         parse_upload_parts(&value["data"], plan)
     }
-    pub async fn upload_part(
-        &self,
-        plan: &UploadPlan,
-        part: &UploadPart,
-        body: reqwest::Body,
-    ) -> Result<(), String> {
-        let mut request = if plan.legacy {
-            self.transfer_http.post(&part.url)
-        } else {
-            self.transfer_http.put(&part.url)
-        };
-        request = request.header("Content-Length", part.size).body(body);
-        if plan.legacy {
-            request = request
-                .header(
-                    "Content-Type",
-                    format!("text/plain;name={}", ascii_filename(&plan.name)),
-                )
-                .header("contentSize", plan.size)
-                .header(
-                    "range",
-                    format!(
-                        "bytes={}-{}",
-                        part.offset,
-                        part.offset.saturating_add(part.size).saturating_sub(1)
-                    ),
-                )
-                .header(
-                    "uploadtaskID",
-                    plan.legacy_task_id.as_deref().unwrap_or(&plan.upload_id),
-                )
-                .header("rangeType", "0");
-        } else {
-            request = request
-                .header("Content-Type", "application/octet-stream")
-                .header("Origin", "https://yun.139.com")
-                .header("Referer", "https://yun.139.com/");
-        }
-        let response = request
+    pub async fn upload_part(&self, part: &UploadPart, body: reqwest::Body) -> Result<(), String> {
+        let response = self
+            .transfer_http
+            .put(&part.url)
+            .header("Content-Length", part.size)
+            .header("Content-Type", "application/octet-stream")
+            .header("Origin", "https://yun.139.com")
+            .header("Referer", "https://yun.139.com/")
+            .body(body)
             .send()
             .await
             .map_err(|e| format!("分片上传失败：{}", e.without_url()))?;
         if response.status().as_u16() != 200 {
             return Err(format!("分片上传返回 HTTP {}", response.status().as_u16()));
         }
-        if plan.legacy {
-            let text = auth::read_text_limited(response, 1024 * 1024).await?;
-            #[derive(Deserialize)]
-            struct ResultXml {
-                #[serde(rename = "resultCode")]
-                code: i32,
-                msg: Option<String>,
-            }
-            let result: ResultXml =
-                quick_xml::de::from_str(&text).map_err(|_| "旧版上传响应 XML 无效")?;
-            if result.code != 0 {
-                return Err(format!(
-                    "分片上传失败：{} ({})",
-                    result.msg.unwrap_or_default(),
-                    result.code
-                ));
-            }
-        }
         Ok(())
     }
     pub async fn complete_upload(&self, plan: &UploadPlan) -> Result<(), String> {
-        if plan.rapid || plan.existing || plan.legacy {
+        if plan.rapid || plan.existing {
             return Ok(());
         }
         let mut body = json!({"contentHash":plan.content_hash,"contentHashAlgorithm":"SHA256","fileId":plan.file_id,"uploadId":plan.upload_id});
@@ -1410,10 +1313,7 @@ fn modern_upload_plan(
         parts: vec![],
         rapid,
         existing,
-        legacy: false,
-        legacy_task_id: None,
         content_hash: sha256.into(),
-        legacy_url: None,
         group_id,
     };
     if !rapid && !existing {
@@ -1442,44 +1342,6 @@ fn parse_upload_parts(data: &Value, plan: &UploadPlan) -> Result<Vec<UploadPart>
     }
     out.sort_by_key(|p| p.part_number);
     Ok(out)
-}
-fn build_upload_parts(
-    plan: &UploadPlan,
-    start: u64,
-    count: usize,
-) -> Result<Vec<UploadPart>, String> {
-    let total = plan.size.max(1).div_ceil(plan.part_size);
-    if start == 0 || start > total {
-        return Err("上传分片编号无效".into());
-    }
-    let url = plan.legacy_url.as_ref().ok_or("旧版上传地址缺失")?;
-    Ok((start..(start + count.min(100) as u64).min(total + 1))
-        .map(|part| {
-            let offset = (part - 1) * plan.part_size;
-            UploadPart {
-                part_number: part,
-                offset,
-                size: plan.size.saturating_sub(offset).min(plan.part_size),
-                url: url.clone(),
-            }
-        })
-        .collect())
-}
-fn ascii_filename(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.chars() {
-        if c.is_ascii() && !c.is_control() {
-            if c == '"' || c == '\\' {
-                out.push('\\');
-            }
-            out.push(c);
-        } else {
-            for code in c.to_string().encode_utf16() {
-                out.push_str(&format!("\\u{code:04x}"));
-            }
-        }
-    }
-    out
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1820,7 +1682,7 @@ mod live_upload_tests {
             );
             let part = plan.parts.first().expect("Upload part");
             client
-                .upload_part(&plan, part, reqwest::Body::from(bytes.as_slice().to_vec()))
+                .upload_part(part, reqwest::Body::from(bytes.as_slice().to_vec()))
                 .await?;
             client.complete_upload(&plan).await?;
             let url = client.link(&remote).await?;

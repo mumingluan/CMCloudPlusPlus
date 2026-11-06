@@ -63,22 +63,6 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .map_err(|e| e.to_string())?;
-        let has_skip_hash = db
-            .prepare("PRAGMA table_info(transfers)")
-            .map_err(|e| e.to_string())?
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|name| name == "skip_hash");
-        if !has_skip_hash {
-            db.execute(
-                "ALTER TABLE transfers ADD COLUMN skip_hash INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
         Ok(Self {
             db: Mutex::new(db),
             directory: directory.to_path_buf(),
@@ -109,25 +93,6 @@ impl Store {
         }
         let db = self.db.lock().map_err(|_| "设置存储不可用".to_string())?;
         db.execute("INSERT INTO settings(key,value) VALUES ('concurrency',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [concurrency.to_string()]).map_err(|e|e.to_string())?;
-        Ok(())
-    }
-
-    pub fn skip_hash(&self) -> Result<bool, String> {
-        use rusqlite::OptionalExtension;
-        let db = self.db.lock().map_err(|_| "设置存储不可用")?;
-        let value: Option<String> = db
-            .query_row(
-                "SELECT value FROM settings WHERE key='skip_upload_hash'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        Ok(value.as_deref() == Some("true"))
-    }
-    pub fn save_skip_hash(&self, value: bool) -> Result<(), String> {
-        let db = self.db.lock().map_err(|_| "设置存储不可用")?;
-        db.execute("INSERT INTO settings(key,value) VALUES ('skip_upload_hash',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [value.to_string()]).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -396,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_policy_and_multi_account_migration_survive_restart() {
+    fn multi_account_migration_survives_restart() {
         let directory = TestDirectory::new();
         {
             let store = Store::new(&directory.0).unwrap();
@@ -418,30 +383,12 @@ mod tests {
                 .unwrap();
             vault.active_id = None;
             vault.save(&store).unwrap();
-            store.save_skip_hash(true).unwrap();
-            store.db.lock().unwrap().execute("INSERT INTO transfers(id,direction,remote_json,local_path,name,total_bytes,status,created_at,updated_at,skip_hash) VALUES('upload','upload','{}','local','file',2199023255552,'paused',0,0,1)", []).unwrap();
-            store.save_skip_hash(false).unwrap();
         }
         let store = Store::new(&directory.0).unwrap();
         let vault = crate::sessions::Sessions::load(&store).unwrap();
         assert_eq!(vault.accounts.len(), 2);
         assert_eq!(vault.accounts[0].authorization, "old-credential");
         assert!(vault.active_id.is_none());
-        assert!(!store.skip_hash().unwrap());
-        let skip: bool = store
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT skip_hash FROM transfers WHERE id='upload'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            skip,
-            "An existing task keeps its policy when defaults change"
-        );
         let encrypted = fs::read(directory.0.join("account.vault")).unwrap();
         assert!(!String::from_utf8_lossy(&encrypted).contains("credential"));
     }

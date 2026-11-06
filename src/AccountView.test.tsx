@@ -40,7 +40,6 @@ const props = () => ({
   quota: null,
   onConnected: vi.fn(),
   onLogout: vi.fn(),
-  onReturn: vi.fn(),
   alert: vi.fn(),
 });
 beforeEach(() => {

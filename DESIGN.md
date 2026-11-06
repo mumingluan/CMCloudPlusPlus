@@ -142,7 +142,7 @@
   "file-row":
     "backgroundColor": "{colors.surface}"
     "textColor": "{colors.file-text}"
-    "height": "64px"
+    "height": "48px"
   "file-row-selected":
     "backgroundColor": "{colors.row-selected}"
   "transfer-details":
@@ -168,7 +168,7 @@
 - 白色工作面、灰蓝色导航、清晰的蓝色重点操作。
 - 紧凑文字层级与规整行列，数字使用等宽数字特性。
 - 轻度圆角、细分隔线，浮层具有明确层级。
-- 手机控件保持可触达，完整信息通过详情展开。
+- 手机控件保持可触达，文件操作通过统一菜单展开。
 
 当前规范从 `src/styles.css` 与 `src/App.tsx` 提取；现有桌面、手机、选择、登录和传输详情截图位于 `.impeccable/review/`。
 
@@ -180,7 +180,7 @@
 
 - **操作蓝**（`accent`）：上传、确认、保存和连接等主要操作，以及选择数量和焦点。
 - **深操作蓝**（`accent-hover`）：可用主要按钮的悬停反馈。
-- **浅导航蓝 / 选中蓝**（`nav-active`、`row-selected`、`row-focused`）：当前导航、文件选择与详情关联行。
+- **浅导航蓝 / 选中蓝**（`nav-active`、`row-selected`、`row-focused`）：当前导航、文件选择与键盘焦点。
 - **标签蓝**（`chip-surface`、`chip-text`）：云端、只读等短状态标签。
 - **进度蓝**（`progress-value`）：细进度条中的完成部分。
 
@@ -219,13 +219,13 @@
 
 工作区采用可伸缩的主区域，文件与传输列表在各自内容区滚动。共享间距集中在 4、6、8、10、12、16、20、24、32px；具体页面使用实际布局尺寸。
 
-- **桌面：** 侧栏宽 228px，顶部条高 68px，工作区内边距为 32px 32px 22px。文件表以名称列吸收剩余空间，文件大小和修改时间按列对齐。详情侧栏默认为 260px。
-- **宽屏（至少 1600px）：** 工作区内边距为 38px 44px 28px，详情侧栏为 290px。
-- **紧凑桌面（至多 1150px）：** 侧栏收为 205px，工作区内边距为 25px 24px 18px；详情展开时隐藏修改时间列。
+- **桌面：** 侧栏宽 228px，顶部条高 68px，工作区内边距为 32px 32px 22px。文件表以名称列吸收剩余空间，文件大小和修改时间按列对齐。
+- **宽屏（至少 1600px）：** 工作区内边距为 38px 44px 28px。
+- **紧凑桌面（至多 1150px）：** 侧栏收为 205px，工作区内边距为 25px 24px 18px。
 - **中间宽度（至多 900px）：** 账号页保持单列任务布局，文件行的更多操作持续可见。
-- **手机（至多 700px）：** 侧栏隐藏，顶部条为 58px 加顶部安全区，主区内边距为 18px 17px 15px。底部导航为 65px 加底部安全区，内容和详情面板为它预留空间。
+- **手机（至多 700px）：** 侧栏隐藏，顶部条为 58px 加顶部安全区，主区内边距为 18px 17px 15px。底部导航为 65px 加底部安全区，内容为它预留空间。
 - **手机文件表：** 名称与大小保留，修改时间列隐藏；表格横向贴近屏幕边缘。工具栏可换行，搜索占独立整行。
-- **列表密度：** 文件默认行高 64px，紧凑模式为 48px；传输列表按 120px 行高组织。选择状态在原工具栏位置显露批量操作。
+- **列表密度：** 桌面文件行高固定 48px，移动端固定 64px；传输列表按 120px 行高组织。选择状态在原工具栏位置显露批量操作。
 - **触达：** 手机图标按钮、选择区域、主要表单字段、列表导航与操作按钮至少提供 48px 的交互尺寸；传输控制间距为 8px。
 
 ## Elevation & Depth
@@ -240,7 +240,7 @@
 
 **The Quiet Surface Rule.** 文件行、登录面板和设置面板以色面和边界分层；阴影集中于对话框与提示。
 
-状态色变化通常持续 0.16s，文件行反馈持续 0.12s，开关持续 0.18s。手机详情采用 0.18s 的轻度横向进入。读取旋转与骨架脉冲表达进行状态；减少动态效果时关闭动画和过渡。
+状态色变化通常持续 0.16s，文件行反馈持续 0.12s，开关持续 0.18s。读取旋转与骨架脉冲表达进行状态；减少动态效果时关闭动画和过渡。
 
 ## Shapes
 
@@ -280,7 +280,7 @@
 
 ### File Rows & Batch Actions
 
-文件名、类型、大小与时间形成可扫描的行。名称过长时在列表内省略，详情允许完整名称换行。选择行使用浅蓝背景，详情关联行使用更轻的蓝色面；选择后，批量下载、移动、复制和删除在持续的工具栏位置出现。手机的选择区域和更多按钮保持完整触控尺寸。
+文件名、类型、大小与时间形成可扫描的行。工具栏按钮切换图标或列表视图并保存偏好；图标视图按容器宽度分列，每行高 152px，两种视图都使用虚拟滚动。选择行使用浅蓝背景；桌面支持拖框，手机从复选框滑动连续选择，触及边缘自动滚动。右键、键盘菜单键和三点按钮共用文件操作菜单；菜单保留已选择的多个文件，分享空间仅显示只读操作。菜单避开视口边界，支持方向键、Escape 和点击外部关闭。界面禁用默认右键菜单与普通文字选择，输入字段继续支持文字编辑。
 
 ### Transfer Ledger & Details
 
@@ -322,6 +322,6 @@ The desktop sidebar is 218 px wide, collapses to a 68 px rail, and keeps session
 
 Light mode preserves the existing white workspace and slate navigation. Dark mode uses #141e2e working surfaces, #e3eaf5 primary text, #b4c1d5 secondary text, #33415a seams, #83adff links, and #306adc primary buttons with white labels. System mode responds to OS changes; desktop window chrome follows the chosen theme. Preferences persist locally.
 
-Upload policy lives in a flat row above the transfer filters, using the same blue selected buttons, typography, and spacing. On phones the label and three equal-width 48 px controls stack vertically. It is chosen for a batch or an active account session. The persistent default lives in transfer settings. Provider constraints are visible: personal-space upload requires SHA256; the group streaming path can skip the preliminary hash scan.
+Uploads always compute the full SHA256 before starting or resuming an upload. Resumed uploads validate both their stored checksum and source metadata.
 
 Directory updates preserve the loaded working set and pagination during automatic synchronization. Completed uploads are published together in 150 ms batches, then reconciled within a fixed 1.5 s window; an in-flight listing finishes before another automatic request starts. Successful deletion results update the rows immediately, while errors remain actionable on the failed items.

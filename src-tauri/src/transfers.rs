@@ -32,7 +32,7 @@ const MAX_CONCURRENCY: usize = 8;
 const MAX_BATCH: usize = 10_000;
 const MAX_QUEUE: usize = 100_000;
 const IO_BUFFER: usize = 1024 * 1024;
-const JOB_COLUMNS: &str = "id,direction,remote_json,local_path,name,total_bytes,completed_bytes,status,error,created_at,updated_at,attempts,skip_hash";
+const JOB_COLUMNS: &str = "id,direction,remote_json,local_path,name,total_bytes,completed_bytes,status,error,created_at,updated_at,attempts";
 // Uploads may reuse a source in another account. Downloads must reserve their
 // local destination globally, including against an upload still reading it.
 const PATH_CONFLICT_QUERY: &str = "SELECT 1 FROM transfers WHERE local_path=?1 AND status NOT IN ('completed','cancelled') AND (?2='download' OR direction='download' OR account_scope=?3) LIMIT 1";
@@ -53,8 +53,6 @@ pub struct TransferSpec {
     pub local_path: String,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub skip_hash: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,7 +72,6 @@ pub struct TransferJob {
     pub attempts: u32,
     /// Runtime sample; resets after recovery or restart.
     pub speed: f64,
-    pub skip_hash: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -288,7 +285,6 @@ impl TransferManager {
                 updated_at: time,
                 attempts: 0,
                 speed: 0.0,
-                skip_hash: spec.skip_hash,
             });
         }
         {
@@ -316,7 +312,7 @@ impl TransferManager {
                 let mut duplicate = transaction
                     .prepare(PATH_CONFLICT_QUERY)
                     .map_err(|e| e.to_string())?;
-                let mut insert = transaction.prepare("INSERT INTO transfers(id,direction,remote_json,local_path,name,total_bytes,status,created_at,updated_at,account_scope,skip_hash) VALUES(?,?,?,?,?,?,'queued',?,?,?,?)").map_err(|e| e.to_string())?;
+                let mut insert = transaction.prepare("INSERT INTO transfers(id,direction,remote_json,local_path,name,total_bytes,status,created_at,updated_at,account_scope) VALUES(?,?,?,?,?,?,'queued',?,?,?)").map_err(|e| e.to_string())?;
                 for job in &jobs {
                     if duplicate
                         .query_row(
@@ -340,7 +336,6 @@ impl TransferManager {
                             job.created_at,
                             job.updated_at,
                             scope,
-                            job.skip_hash
                         ])
                         .map_err(|e| e.to_string())?;
                 }
@@ -894,47 +889,53 @@ impl TransferManager {
         if size != job.total_bytes {
             return Err("本地文件大小已变化，请重新添加任务".into());
         }
+        let hash = {
+            let mut hash = Sha256::new();
+            let mut buffer = vec![0u8; IO_BUFFER];
+            let mut hashed = 0u64;
+            let mut meter = Meter::new(0);
+            loop {
+                control.check()?;
+                let read = file.read(&mut buffer).await.map_err(|e| e.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                hash.update(&buffer[..read]);
+                hashed += read as u64;
+                if meter.ready() {
+                    self.progress(job, hashed, size, meter.sample(hashed), "hashing");
+                }
+            }
+            if hashed != size {
+                return Err("计算哈希时本地文件发生变化".into());
+            }
+            hex::encode(hash.finalize()).to_uppercase()
+        };
+        control.check()?;
+        let hash_metadata = file.metadata().await.map_err(|e| e.to_string())?;
+        if hash_metadata.len() != size || metadata_stamp(&hash_metadata) != modified {
+            return Err("计算哈希时本地文件发生变化，请重新添加任务".into());
+        }
         let previous: Option<UploadJournal> = self
             .journal(&job.id)?
-            .and_then(|s| serde_json::from_str(&s).ok());
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            // Recreate obsolete streaming sessions through the current upload protocol.
+            .filter(|value| value["plan"]["legacy"].as_bool() != Some(true))
+            .and_then(|value| serde_json::from_value(value).ok());
         let mut first_part = None;
         let mut journal = match previous {
-            Some(journal) if journal.source_size == size && journal.source_modified == modified => {
+            Some(mut journal)
+                if journal.source_size == size && journal.source_modified == modified =>
+            {
+                if !journal.plan.content_hash.is_empty() && journal.plan.content_hash != hash {
+                    return Err("本地文件内容已变化，不能复用上传断点，请重新添加任务".into());
+                }
+                journal.plan.content_hash = hash.clone();
+                self.save_journal(&job.id, &journal)?;
                 journal
             }
             Some(_) => return Err("本地文件已修改，不能复用上传断点，请重新添加任务".into()),
             None => {
-                let cfg = client.account_config().await;
-                let legacy = cfg.space == "group" && cfg.use_old_stream_upload;
-                let hash = if legacy || (job.skip_hash && cfg.space == "group") {
-                    String::new()
-                } else {
-                    let mut hash = Sha256::new();
-                    let mut buffer = vec![0u8; IO_BUFFER];
-                    let mut hashed = 0u64;
-                    let mut meter = Meter::new(0);
-                    loop {
-                        control.check()?;
-                        let read = file.read(&mut buffer).await.map_err(|e| e.to_string())?;
-                        if read == 0 {
-                            break;
-                        }
-                        hash.update(&buffer[..read]);
-                        hashed += read as u64;
-                        if meter.ready() {
-                            self.progress(job, hashed, size, meter.sample(hashed), "hashing");
-                        }
-                    }
-                    if hashed != size {
-                        return Err("计算哈希时本地文件发生变化".into());
-                    }
-                    hex::encode(hash.finalize()).to_uppercase()
-                };
-                control.check()?;
-                let hash_metadata = file.metadata().await.map_err(|e| e.to_string())?;
-                if hash_metadata.len() != size || metadata_stamp(&hash_metadata) != modified {
-                    return Err("计算哈希时本地文件发生变化，请重新添加任务".into());
-                }
                 let mut plan = client
                     .prepare_upload(&job.remote, &job.name, size, &hash)
                     .await?;
@@ -1072,7 +1073,7 @@ impl TransferManager {
                     }
                 };
                 tokio::select! {
-                    result = client.upload_part(&journal.plan, &part, body) => result?,
+                    result = client.upload_part(&part, body) => result?,
                     _ = stalled => return Err("上传超过 120 秒没有进展，保留已确认分片并自动重试".into()),
                     _ = control.changed.notified() => { control.check()?; return Err("上传已停止".into()); }
                 }
@@ -1249,7 +1250,6 @@ fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferJob> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         attempts: row.get(11)?,
-        skip_hash: row.get(12)?,
         speed: 0.0,
     })
 }

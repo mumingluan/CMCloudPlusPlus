@@ -38,7 +38,6 @@ export interface LoginConfig {
   customUploadPartSize: number;
   reportRealSize: boolean;
   useLargeThumbnail: boolean;
-  useOldStreamUpload: boolean;
 }
 export interface TransferJob {
   id: string;
@@ -85,5 +84,4 @@ export const initialConfig: LoginConfig = {
   customUploadPartSize: 0,
   reportRealSize: true,
   useLargeThumbnail: false,
-  useOldStreamUpload: false,
 };
