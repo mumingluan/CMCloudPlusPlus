@@ -7,6 +7,7 @@ import type { RepositoryView } from './repositoryApi';
 
 const mocked = vi.hoisted(() => ({
   list: vi.fn(),
+  mkdir: vi.fn(),
   controlBatch: vi.fn(),
   jobs: vi.fn(),
   previewJobs: [] as TransferJob[],
@@ -15,10 +16,14 @@ const mocked = vi.hoisted(() => ({
   preview: vi.fn(),
   space: 'group' as AccountSummary['space'],
   probe: vi.fn(),
+  createNamedRepository: vi.fn(),
   openRepository: vi.fn(),
   listRepository: vi.fn(),
   closeRepository: vi.fn(),
   labelCache: vi.fn(),
+  probeCrypt: vi.fn(),
+  createCrypt: vi.fn(),
+  closeCrypt: vi.fn(),
 }));
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: mocked.openUrl }));
 vi.mock('./api', () => ({
@@ -39,10 +44,23 @@ vi.mock('./repositoryApi', async (importOriginal) => {
     repositoryApi: {
       ...actual.repositoryApi,
       probe: mocked.probe,
+      createNamed: mocked.createNamedRepository,
       open: mocked.openRepository,
       list: mocked.listRepository,
       close: mocked.closeRepository,
       labelCache: mocked.labelCache,
+    },
+  };
+});
+vi.mock('./cryptApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./cryptApi')>();
+  return {
+    ...actual,
+    cryptApi: {
+      ...actual.cryptApi,
+      probe: mocked.probeCrypt,
+      create: mocked.createCrypt,
+      close: mocked.closeCrypt,
     },
   };
 });
@@ -103,6 +121,10 @@ beforeEach(() => {
   localStorage.clear();
   history.replaceState(null, '', '/?preview=scale');
   mocked.list.mockResolvedValue({ files: [], nextCursor: null });
+  mocked.mkdir.mockResolvedValue(undefined);
+  mocked.closeRepository.mockResolvedValue(undefined);
+  mocked.probeCrypt.mockResolvedValue([]);
+  mocked.closeCrypt.mockResolvedValue(undefined);
   mocked.link.mockResolvedValue('https://storage.example/file');
   mocked.openUrl.mockResolvedValue(undefined);
   HTMLDialogElement.prototype.showModal = function () {
@@ -995,3 +1017,95 @@ it('does not cancel from the toolbar until confirmation and sends the selected d
   expect(mocked.controlBatch).toHaveBeenCalledExactlyOnceWith('cancel', 'upload');
   expect(screen.queryByRole('dialog', { name: '取消上传？' })).toBeNull();
 });
+
+it('stays in the outer directory after creating a folder, object repository, or encrypted folder', async () => {
+  mocked.space = 'personal_new';
+  mocked.probe.mockResolvedValue([{ folderId: 'folder', state: 'ordinary' }]);
+  const outerFiles = [
+    { id: 'folder', name: '文件夹', path: '/folder', isDir: true, size: 0, modifiedAt: '' },
+  ];
+  mocked.list.mockImplementation(async () => ({ files: [...outerFiles], nextCursor: null }));
+  mocked.mkdir.mockImplementation(async (_parent, name: string) => {
+    outerFiles.push({ id: `dir:${name}`, name, path: `/${name}`, isDir: true, size: 0, modifiedAt: '' });
+  });
+  mocked.createNamedRepository.mockImplementation(async (_parent, name: string) => ({
+    handle: 'repo-create-handle',
+    folderId: 'repo-created-id',
+    repositoryId: 'repo-guid-1',
+    name,
+    encrypted: false,
+    directory: '',
+    revision: 'rev-1',
+    unlockRevision: 'unlock-1',
+    policy: 'normal',
+    saved: false,
+    unlockMethods: [],
+    items: [],
+  }));
+  mocked.createCrypt.mockImplementation(async (_parent, name: string) => ({
+    handle: 'crypt-create-handle',
+    folderId: 'crypt-created-id',
+    name,
+    directory: '',
+    saved: true,
+    options: {
+      filenameEncryption: 'standard',
+      directoryNameEncryption: true,
+      encryptedSuffix: '.bin',
+      filenameEncoding: 'base64',
+    },
+    items: [],
+  }));
+
+  await act(async () => render(<App />));
+
+  // 1. Regular folder creation stays in outer directory
+  fireEvent.click(screen.getByRole('button', { name: '新建文件夹' }));
+  const mkdirDialog = screen.getByRole('dialog');
+  fireEvent.change(within(mkdirDialog).getByLabelText('名称'), { target: { value: '普通新目录' } });
+  await act(async () => {
+    fireEvent.click(within(mkdirDialog).getByRole('button', { name: '确认' }));
+  });
+  expect(screen.queryByRole('button', { name: '退出对象库' })).toBeNull();
+  expect(screen.getByText('普通新目录', { selector: 'strong' })).toBeTruthy();
+
+  // 2. Object repository creation stays in outer directory and closes temporary session handle
+  fireEvent.click(screen.getByRole('button', { name: '新建对象库' }));
+  const repoDialog = screen.getByRole('dialog');
+  fireEvent.change(within(repoDialog).getByLabelText('对象库名称'), {
+    target: { value: '新建普通库' },
+  });
+  fireEvent.change(within(repoDialog).getByLabelText('对象库类型'), {
+    target: { value: 'plain' },
+  });
+  await act(async () => {
+    fireEvent.click(within(repoDialog).getByRole('button', { name: '创建对象库' }));
+  });
+  expect(mocked.closeRepository).toHaveBeenCalledWith('repo-create-handle');
+  expect(screen.queryByRole('button', { name: '退出对象库' })).toBeNull();
+  expect(within(document.querySelector<HTMLElement>('.address-bar')!).queryByText('新建普通库')).toBeNull();
+  expect(within(row('新建普通库') as HTMLElement).getByRole('img', { name: 'AxuanStor 对象库' })).toBeTruthy();
+  expect(screen.getByText('普通新目录', { selector: 'strong' })).toBeTruthy();
+
+  // 3. Encrypted folder creation stays in outer directory and closes temporary session handle
+  fireEvent.click(screen.getByRole('button', { name: '新建加密文件夹' }));
+  const cryptDialog = screen.getByRole('dialog');
+  fireEvent.change(within(cryptDialog).getByLabelText('文件夹名称'), {
+    target: { value: '新建加密目录' },
+  });
+  fireEvent.change(within(cryptDialog).getByLabelText('加密密码 (password)'), {
+    target: { value: 'correct-horse-battery' },
+  });
+  fireEvent.change(within(cryptDialog).getByLabelText('确认密码'), {
+    target: { value: 'correct-horse-battery' },
+  });
+  await act(async () => {
+    fireEvent.click(within(cryptDialog).getByRole('button', { name: /创建加密文件夹/ }));
+  });
+  expect(mocked.closeCrypt).toHaveBeenCalledWith('crypt-create-handle');
+  expect(screen.queryByRole('button', { name: '退出加密文件夹' })).toBeNull();
+  expect(within(document.querySelector<HTMLElement>('.address-bar')!).queryByText('新建加密目录')).toBeNull();
+  expect(within(row('新建加密目录') as HTMLElement).getByRole('img', { name: /加密文件夹/ })).toBeTruthy();
+  expect(screen.getByText('新建普通库', { selector: 'strong' })).toBeTruthy();
+});
+

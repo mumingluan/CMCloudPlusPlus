@@ -710,7 +710,11 @@ function App() {
             files: snapshot.items.map((item) => cryptFile(snapshot.folderId, item)),
             nextCursor: null,
           };
-        } else page = await api.list(dir, next);
+        } else {
+          if (repositoryFolderRef.current || cryptFolderRef.current) return;
+          page = await api.list(dir, next);
+          if (repositoryFolderRef.current || cryptFolderRef.current) return;
+        }
         if (generation.current !== requestGeneration) return;
         setFiles((previous) => {
           if (generation.current !== requestGeneration) return previous;
@@ -779,6 +783,8 @@ function App() {
         disposed ||
         !account ||
         parent.sourceId ||
+        repositoryFolderRef.current ||
+        cryptFolderRef.current ||
         change.accountId !== account.id ||
         change.space !== account.space ||
         change.cloudId !== account.cloudId ||
@@ -792,6 +798,10 @@ function App() {
         if (publish === undefined)
           publish = setTimeout(() => {
             publish = undefined;
+            if (repositoryFolderRef.current || cryptFolderRef.current) {
+              pending.clear();
+              return;
+            }
             const updates = new Map(pending);
             pending.clear();
             for (const id of removedFiles.current) updates.delete(id);
@@ -3113,27 +3123,32 @@ function App() {
           onCreated={(view, name) => {
             setCreatingRepository(false);
             setSelection(new Set());
-            setRepositoryEpoch((v) => v + 1);
-            setRepositoryFolder({
-              file: {
-                id: view.folderId,
-                name,
-                path: `${parent.path}/${name}`,
-                isDir: true,
-                size: 0,
-                modifiedAt: new Date().toISOString(),
-              },
-              probe: {
+            void repositoryApi.close(view.handle).catch(() => {});
+            const createdFile: CloudFile = {
+              id: view.folderId,
+              name,
+              path: `${parent.path}/${name}`,
+              isDir: true,
+              size: 0,
+              modifiedAt: new Date().toISOString(),
+            };
+            changedFiles.current.set(createdFile.id, createdFile);
+            removedFiles.current.delete(createdFile.id);
+            setFiles((previous) => [
+              createdFile,
+              ...previous.filter((entry) => entry.id !== createdFile.id),
+            ]);
+            rememberRepositoryProbes([
+              {
                 folderId: view.folderId,
                 repositoryId: view.repositoryId,
                 kind: view.encrypted ? 'encrypted' : 'plain',
                 state: 'repository',
                 saved: view.saved,
               },
-              initialView: view,
-              cloudPath: formatCloudPath([...trail.slice(1), { name }]),
-            });
+            ]);
             refresh(true);
+            alert('对象库已创建');
           }}
         />
       )}
@@ -3144,7 +3159,21 @@ function App() {
           onCreated={(view, name) => {
             setCreatingCryptFolder(false);
             setSelection(new Set());
-            setCryptEpoch((v) => v + 1);
+            void cryptApi.close(view.handle).catch(() => {});
+            const createdFile: CloudFile = {
+              id: view.folderId,
+              name,
+              path: `${parent.path}/${name}`,
+              isDir: true,
+              size: 0,
+              modifiedAt: new Date().toISOString(),
+            };
+            changedFiles.current.set(createdFile.id, createdFile);
+            removedFiles.current.delete(createdFile.id);
+            setFiles((previous) => [
+              createdFile,
+              ...previous.filter((entry) => entry.id !== createdFile.id),
+            ]);
             rememberCryptProbes([
               {
                 folderId: view.folderId,
@@ -3153,26 +3182,8 @@ function App() {
                 options: view.options,
               },
             ]);
-            setCryptFolder({
-              file: {
-                id: view.folderId,
-                name,
-                path: `${parent.path}/${name}`,
-                isDir: true,
-                size: 0,
-                modifiedAt: new Date().toISOString(),
-              },
-              probe: {
-                folderId: view.folderId,
-                known: true,
-                saved: view.saved,
-                options: view.options,
-              },
-              initialView: view,
-              cloudPath: formatCloudPath([...trail.slice(1), { name }]),
-              route,
-            });
             refresh(true);
+            alert('加密文件夹已创建');
           }}
         />
       )}
