@@ -1,6 +1,6 @@
 [package]
 name = "cmcloud"
-version = "0.1.9"
+version = "0.3.0"
 description = "China Mobile Cloud third-party desktop and mobile client"
 authors = ["CMCloud++ Contributors"]
 license = "AGPL-3.0-or-later"
