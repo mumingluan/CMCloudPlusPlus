@@ -334,11 +334,28 @@
   }
 }
 
-.files-workspace[hidden] {
-  display: none;
+.workspace[hidden],
+.files-workspace[hidden],
+.repository-opening[hidden],
+.repository-session[hidden] {
+  display: none !important;
+}
+.repository-opening {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(36px + env(safe-area-inset-bottom));
+}
+.repository-opening > * {
+  flex-shrink: 0;
 }
 .repository-modal {
   width: min(calc(100% - 32px), 640px);
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 0;
 }
 dialog.repository-modal[open] {

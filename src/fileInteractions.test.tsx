@@ -1109,3 +1109,20 @@ it('stays in the outer directory after creating a folder, object repository, or 
   expect(screen.getByText('新建普通库', { selector: 'strong' })).toBeTruthy();
 });
 
+it('dismisses un-unlocked encrypted folder screen when switching navigation tabs without overlaying target page', async () => {
+  mocked.space = 'personal_new';
+  mocked.probe.mockResolvedValue([{ folderId: 'folder', state: 'ordinary' }]);
+
+  await act(async () => render(<App />));
+  fireEvent.contextMenu(row('文件夹'));
+  fireEvent.click(screen.getByRole('menuitem', { name: '以加密文件夹打开' }));
+  expect(screen.getByRole('heading', { name: '解锁加密文件夹' })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: '设置' }));
+  expect(screen.queryByRole('heading', { name: '解锁加密文件夹' })).toBeNull();
+  expect(document.querySelector('.repository-opening')).toBeNull();
+
+  fireEvent.click(screen.getByRole('button', { name: '我的文件' }));
+  expect(row('文件夹')).toBeTruthy();
+});
+

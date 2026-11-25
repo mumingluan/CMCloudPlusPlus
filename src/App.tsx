@@ -965,10 +965,16 @@ function App() {
   const switchRoute = (next: Route) => {
     if (next === route) {
       setPreviewFile(null);
+      if (cryptFolder && !cryptRef.current && !cryptBusy) closeCrypt();
+      if (repositoryFolder && !repositoryRef.current && !repositoryBusy) closeRepository();
       return;
     }
-    if (next === 'shares' && repositoryFolder) closeRepository();
-    if (cryptFolder && (next === 'shares' || route === 'shares')) closeCrypt();
+    if (repositoryFolder && (next === 'shares' || (!repositoryRef.current && !repositoryBusy))) {
+      closeRepository();
+    }
+    if (cryptFolder && (next === 'shares' || route === 'shares' || (!cryptRef.current && !cryptBusy))) {
+      closeCrypt();
+    }
     if (next === 'shares' || route === 'shares') {
       generation.current++;
       setFiles([]);
