@@ -36,7 +36,6 @@ pub struct AccountConfig {
     pub user_domain_id: String,
     pub link_id: String,
     pub custom_upload_part_size: u64,
-    pub report_real_size: bool,
     pub use_large_thumbnail: bool,
 }
 impl Default for AccountConfig {
@@ -55,12 +54,19 @@ impl Default for AccountConfig {
             user_domain_id: String::new(),
             link_id: String::new(),
             custom_upload_part_size: 0,
-            report_real_size: true,
             use_large_thumbnail: false,
         }
     }
 }
 impl AccountConfig {
+    pub fn keep_personal_space(&mut self) {
+        if self.space != "personal_new" {
+            self.root_id.clear();
+        }
+        self.space = "personal_new".into();
+        self.cloud_id.clear();
+        self.link_id.clear();
+    }
     /// Keep saved credentials usable after a provider space is retired. Directory
     /// identifiers must not cross spaces; existing transfers keep their scope.
     pub fn migrate_saved_space(&mut self) {
@@ -82,6 +88,8 @@ pub struct CloudFile {
     pub size: u64,
     pub modified_at: String,
     pub thumbnail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +105,21 @@ pub struct UploadPart {
     pub size: u64,
     pub url: String,
 }
+
+#[derive(Debug)]
+pub enum UploadPartError {
+    Rejected(reqwest::StatusCode),
+    Transport(String),
+}
+
+impl From<UploadPartError> for String {
+    fn from(error: UploadPartError) -> Self {
+        match error {
+            UploadPartError::Rejected(status) => format!("分片上传返回 HTTP {}", status.as_u16()),
+            UploadPartError::Transport(message) => message,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadPlan {
@@ -110,15 +133,6 @@ pub struct UploadPlan {
     pub existing: bool,
     pub content_hash: String,
     pub group_id: Option<String>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpaceInfo {
-    pub kind: String,
-    pub label: String,
-    pub cloud_id: String,
-    pub root_id: String,
-    pub read_only: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +268,27 @@ fn validate_host(value: &str) -> Result<String, String> {
 }
 
 impl CloudClient {
+    pub async fn for_browse_source(&self, kind: &str, reference: &str) -> Result<Self, String> {
+        let mut config = self.account_config().await;
+        config.space = kind.into();
+        let root = if kind == "group" {
+            let routes = self.routes.read().await;
+            if routes.group.is_empty() || routes.group_album.is_empty() {
+                return Err("云盘未返回群组路由".into());
+            }
+            config.cloud_id = reference.into();
+            reference
+        } else {
+            config.link_id = reference.into();
+            "root"
+        };
+        config.root_id = root.into();
+        Ok(Self {
+            config: Arc::new(RwLock::new(config)),
+            ..self.clone()
+        })
+    }
+
     pub fn new(config: AccountConfig) -> Result<Self, String> {
         if !["personal_new", "group", "share"].contains(&config.space.as_str()) {
             return Err("未知的云盘空间类型".into());
@@ -582,6 +617,7 @@ impl CloudClient {
                             size: number(item, "size"),
                             modified_at: string(item, "updatedAt"),
                             thumbnail: thumb.and_then(|v| optional(string(v, "url"))),
+                            source_id: None,
                         }
                     })
                     .collect();
@@ -827,9 +863,6 @@ impl CloudClient {
     pub async fn move_file(&self, file: &CloudFile, destination: &CloudFile) -> Result<(), String> {
         self.move_or_copy(file, destination, false).await
     }
-    pub async fn r#move(&self, file: &CloudFile, destination: &CloudFile) -> Result<(), String> {
-        self.move_file(file, destination).await
-    }
     pub async fn copy(&self, file: &CloudFile, destination: &CloudFile) -> Result<(), String> {
         self.move_or_copy(file, destination, true).await
     }
@@ -921,6 +954,241 @@ impl CloudClient {
         }
         Ok(())
     }
+
+    pub async fn remove_personal_ids(&self, ids: &[String]) -> Result<(), String> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let cfg = self.account_config().await;
+        if cfg.space != "personal_new" {
+            return Err("仅支持个人云批量移入回收站".into());
+        }
+        for chunk in ids.chunks(50) {
+            self.modern_post("/recyclebin/batchTrash", &json!({"fileIds": chunk}), false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn file_digest(&self, file_id: &str) -> Result<(u64, String, Option<i64>), String> {
+        let cfg = self.account_config().await;
+        if cfg.space != "personal_new" {
+            return Err("仅支持个人云文件校验信息读取".into());
+        }
+        let value = self
+            .modern_post("/file/get", &json!({"fileId": file_id}), false)
+            .await?;
+        let data = &value["data"];
+        if string(data, "fileId") != file_id || string(data, "type") != "file" {
+            return Err("所选云盘文件不存在或类型已变化".into());
+        }
+        let size = number(data, "size");
+        let algo = string(data, "contentHashAlgorithm");
+        let hash = string(data, "contentHash").to_ascii_lowercase();
+        if !algo.eq_ignore_ascii_case("SHA256")
+            || hash.len() != 64
+            || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("云盘未提供完整的 SHA256 摘要".into());
+        }
+        let modified = parse_cloud_millis(&string(data, "updatedAt"));
+        Ok((size, hash, modified))
+    }
+
+    pub async fn list_personal_entries(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<(CloudFile, String, Option<i64>)>, String> {
+        let cfg = self.account_config().await;
+        if cfg.space != "personal_new" {
+            return Err("仅支持个人云目录枚举".into());
+        }
+        let mut out = Vec::new();
+        let mut cursor = String::new();
+        let mut seen_cursors = HashSet::new();
+        let mut seen_ids = HashSet::new();
+        loop {
+            let value = self
+                .modern_post(
+                    "/file/list",
+                    &json!({
+                        "orderBy": "name",
+                        "orderDirection": "ASC",
+                        "pageInfo": {"pageCursor": cursor, "pageSize": 200},
+                        "parentFileId": parent_id
+                    }),
+                    false,
+                )
+                .await?;
+            let data = &value["data"];
+            for item in array(data, "items") {
+                let id = string(item, "fileId");
+                if id.is_empty() || !seen_ids.insert(id.clone()) {
+                    continue;
+                }
+                let is_dir = string(item, "type") == "folder";
+                let updated = string(item, "updatedAt");
+                let modified = parse_cloud_millis(&updated);
+                let hash = if !is_dir
+                    && string(item, "contentHashAlgorithm").eq_ignore_ascii_case("SHA256")
+                {
+                    let h = string(item, "contentHash").to_ascii_lowercase();
+                    if h.len() == 64
+                        && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    {
+                        h
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                out.push((
+                    CloudFile {
+                        id,
+                        name: string(item, "name"),
+                        path: parent_id.into(),
+                        is_dir,
+                        size: if is_dir { 0 } else { number(item, "size") },
+                        modified_at: updated,
+                        thumbnail: None,
+                        source_id: None,
+                    },
+                    hash,
+                    modified,
+                ));
+                if out.len() > 100_000 {
+                    return Err("单次跨对象库操作超出 100,000 项，请分批处理".into());
+                }
+            }
+            match optional(string(data, "nextPageCursor")) {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = next,
+                Some(_) => return Err("云盘目录分页异常".into()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn materialize_dedup_file(
+        &self,
+        parent_id: &str,
+        name: &str,
+        size: u64,
+        sha256: &str,
+        source_file_id: Option<&str>,
+    ) -> Result<String, String> {
+        validate_name(name)?;
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("对象摘要无效".into());
+        }
+        let cfg = self.account_config().await;
+        if cfg.space != "personal_new" {
+            return Err("仅支持向个人云目录导出对象库文件".into());
+        }
+        let part_size = 100 * 1024 * 1024u64;
+        let count = size.max(1).div_ceil(part_size);
+        let part_infos: Vec<Value> = (1..=count.min(100))
+            .map(|part| part_info(size, part_size, part))
+            .collect();
+        let value = self
+            .modern_post(
+                "/file/create",
+                &json!({
+                    "contentHash": sha256.to_ascii_uppercase(),
+                    "contentHashAlgorithm": "SHA256",
+                    "contentType": "application/octet-stream",
+                    "parallelUpload": false,
+                    "partInfos": part_infos,
+                    "size": size,
+                    "parentFileId": parent_id,
+                    "name": name,
+                    "type": "file",
+                    "fileRenameMode": "auto_rename"
+                }),
+                false,
+            )
+            .await?;
+        let data = &value["data"];
+        let created_id = string(data, "fileId");
+        if created_id.is_empty() {
+            return Err("云盘未返回新文件标识".into());
+        }
+        let returned_name = optional(string(data, "fileName"))
+            .or_else(|| optional(string(data, "name")))
+            .unwrap_or_else(|| name.into());
+        let rapid = match data.get("partInfos") {
+            Some(Value::Null) => true,
+            Some(Value::Array(parts)) if !parts.is_empty() => false,
+            Some(Value::Array(_)) | None
+                if data["rapidUpload"] == true
+                    || data["exist"] == true
+                    || data["fileExist"] == true =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if rapid {
+            if returned_name != name {
+                let _ = self.remove_personal_ids(&[created_id]).await;
+                return Err(format!("目标目录已存在同名文件：{name}"));
+            }
+            return Ok(created_id);
+        }
+        if size == 0 {
+            let plan = modern_upload_plan(data, name, 0, part_size, sha256, None)?;
+            if returned_name != name {
+                let _ = self.remove_personal_ids(&[plan.file_id]).await;
+                return Err(format!("目标目录已存在同名文件：{name}"));
+            }
+            if let Some(first) = plan.parts.first() {
+                self.upload_part(first, reqwest::Body::from(Vec::<u8>::new()))
+                    .await
+                    .map_err(|_| "空文件提交失败".to_string())?;
+                self.complete_upload(&plan).await?;
+                return Ok(plan.file_id);
+            }
+        }
+        let _ = self.remove_personal_ids(&[created_id]).await;
+        let src_id = source_file_id
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("云端未能秒传文件 {name}，且缺少原对象引用"))?;
+        let before: HashSet<String> = self
+            .list_personal_entries(parent_id)
+            .await?
+            .into_iter()
+            .map(|(f, _, _)| f.id)
+            .collect();
+        self.modern_post(
+            "/file/batchCopy",
+            &json!({"fileIds": [src_id], "toParentFileId": parent_id}),
+            false,
+        )
+        .await?;
+        let mut copied: Option<(String, String)> = None;
+        for (f, h, _) in self.list_personal_entries(parent_id).await? {
+            if !f.is_dir && !before.contains(&f.id) && f.size == size && (h.is_empty() || h == sha256) {
+                copied = Some((f.id, f.name));
+                break;
+            }
+        }
+        let (copied_id, copied_name) =
+            copied.ok_or_else(|| format!("云端复制对象 {name} 后未找到目标项"))?;
+        if copied_name != name {
+            self.modern_post(
+                "/file/update",
+                &json!({"fileId": copied_id, "name": name, "description": ""}),
+                false,
+            )
+            .await?;
+        }
+        Ok(copied_id)
+    }
     pub async fn quota(&self) -> Result<Quota, String> {
         let cfg = self.account_config().await;
         if cfg.user_domain_id.is_empty() {
@@ -941,32 +1209,6 @@ impl CloudClient {
             used: total.saturating_sub(available),
         })
     }
-    pub async fn spaces(&self) -> Result<Vec<SpaceInfo>, String> {
-        let cfg = self.account_config().await;
-        Ok([
-            ("personal_new", "个人云盘", "/"),
-            ("group", "共享群", ""),
-            ("share", "分享浏览", "root"),
-        ]
-        .into_iter()
-        .map(|(kind, label, root)| SpaceInfo {
-            kind: kind.into(),
-            label: label.into(),
-            cloud_id: if kind == cfg.space {
-                cfg.cloud_id.clone()
-            } else {
-                String::new()
-            },
-            root_id: if kind == cfg.space {
-                cfg.root_id.clone()
-            } else {
-                root.into()
-            },
-            read_only: kind == "share",
-        })
-        .collect())
-    }
-
     pub async fn prepare_upload(
         &self,
         parent: &CloudFile,
@@ -1064,7 +1306,7 @@ impl CloudClient {
             .await?;
         parse_upload_parts(&value["data"], plan)
     }
-    pub async fn upload_part(&self, part: &UploadPart, body: reqwest::Body) -> Result<(), String> {
+    pub async fn upload_part(&self, part: &UploadPart, body: reqwest::Body) -> Result<(), UploadPartError> {
         let response = self
             .transfer_http
             .put(&part.url)
@@ -1075,9 +1317,9 @@ impl CloudClient {
             .body(body)
             .send()
             .await
-            .map_err(|e| format!("分片上传失败：{}", e.without_url()))?;
+            .map_err(|e| UploadPartError::Transport(format!("分片上传失败：{}", e.without_url())))?;
         if response.status().as_u16() != 200 {
-            return Err(format!("分片上传返回 HTTP {}", response.status().as_u16()));
+            return Err(UploadPartError::Rejected(response.status()));
         }
         Ok(())
     }
@@ -1102,6 +1344,26 @@ impl CloudClient {
         Ok(())
     }
 
+    async fn share_directory(&self, reference: &ShareRef) -> Result<Value, String> {
+        self.share_post(
+            "/richlifeApp/devapp/IOutLink/getOutLinkInfoV6",
+            &json!({"getOutLinkInfoReq":{
+                "account": self.account().await?,
+                "linkID": reference.link_id,
+                "passwd": reference.password,
+                "pCaID": reference.node_id
+            }}),
+        ).await
+    }
+
+    pub async fn share_title(&self) -> Result<String, String> {
+        let config = self.account_config().await;
+        let reference = parse_share_entries(&config.link_id)
+            .into_iter().next().ok_or("请填写有效的分享链接")?;
+        let value = self.share_directory(&reference).await?;
+        Ok(optional(string(&value["data"], "lkName")).unwrap_or(reference.link_id))
+    }
+
     async fn share_list(&self, parent: &CloudFile) -> Result<FilePage, String> {
         let cfg = self.account_config().await;
         let refs = if parent.id.starts_with("shares:") {
@@ -1123,7 +1385,7 @@ impl CloudClient {
         let mut first_error = None;
         let mut successes = 0;
         for reference in refs {
-            let result=self.share_post("/richlifeApp/devapp/IOutLink/getOutLinkInfoV6",&json!({"getOutLinkInfoReq":{"account":self.account().await?,"linkID":reference.link_id,"passwd":reference.password,"pCaID":reference.node_id}})).await;
+            let result = self.share_directory(&reference).await;
             let value = match result {
                 Ok(v) => {
                     successes += 1;
@@ -1142,21 +1404,23 @@ impl CloudClient {
                         return Err("分享目录超出 100,000 项，请分组浏览".into());
                     }
                     let name = string(item, if dir { "caName" } else { "coName" });
+                    let node_id = share_node_id(item, dir)?;
                     let new_ref = ShareRef {
-                        node_id: string(item, if dir { "caId" } else { "coId" }),
+                        node_id: node_id.clone(),
                         ..reference.clone()
                     };
                     let file = CloudFile {
-                        id: encode_share_refs(&[new_ref]),
+                        id: if parent.source_id.is_some() { node_id } else { encode_share_refs(&[new_ref]) },
                         name: name.clone(),
                         path: parent.id.clone(),
                         is_dir: dir,
                         size: if dir { 0 } else { number(item, "coSize") },
                         modified_at: string(item, "udTime"),
                         thumbnail: None,
+                        source_id: parent.source_id.clone(),
                     };
-                    if let Some(index) = indices.get(&name).copied() {
-                        if dir && files[index].is_dir {
+                    if let Some(index) = indices.get(&name).copied().filter(|_| parent.source_id.is_none()) {
+                        if dir && files[index].is_dir && parent.source_id.is_none() {
                             let mut merged = decode_share_refs(&files[index].id)?;
                             merged.extend(decode_share_refs(&file.id)?);
                             files[index].id = encode_share_refs(&merged);
@@ -1233,6 +1497,7 @@ fn legacy_files(
             size: 0,
             modified_at: string(item, "updateTime"),
             thumbnail: None,
+            source_id: None,
         });
     }
     for item in array(data, content_key) {
@@ -1244,6 +1509,7 @@ fn legacy_files(
             size: number(item, "contentSize"),
             modified_at: string(item, "updateTime"),
             thumbnail: optional(string(item, "thumbnailURL")),
+            source_id: None,
         });
     }
     files
@@ -1259,6 +1525,23 @@ fn validate_name(name: &str) -> Result<(), String> {
         return Err("文件名不能为空，也不能包含路径分隔符或控制字符".into());
     }
     Ok(())
+}
+fn parse_cloud_millis(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        let ms = dt.timestamp_millis();
+        return axuanstor_sdk::repository::valid_file_modified_at(ms).then_some(ms);
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        let tz = FixedOffset::east_opt(8 * 3600)?;
+        let dt = naive.and_local_timezone(tz).single()?;
+        let ms = dt.timestamp_millis();
+        return axuanstor_sdk::repository::valid_file_modified_at(ms).then_some(ms);
+    }
+    None
 }
 fn valid_download_url(value: String) -> Result<String, String> {
     let url = url::Url::parse(&value).map_err(|_| "云盘未返回有效的下载地址")?;
@@ -1362,6 +1645,43 @@ fn decode_share_refs(id: &str) -> Result<Vec<ShareRef>, String> {
         .map_err(|_| "分享引用编码无效")?;
     serde_json::from_slice(&bytes).map_err(|_| "分享引用内容无效".into())
 }
+fn share_node_id(item: &Value, dir: bool) -> Result<String, String> {
+    let keys = if dir { ["caID", "caId"] } else { ["coID", "coId"] };
+    keys.into_iter()
+        .find_map(|key| optional(string(item, key)))
+        .ok_or_else(|| "云盘未返回分享项目的 ID".into())
+}
+
+pub fn normalize_share_input(input: &str) -> Result<String, String> {
+    let code = input.lines().find_map(|line| {
+        let line = line.trim().strip_prefix("提取码")?;
+        line.trim_start_matches([':', '：', ' ']).split_whitespace().next()
+    });
+    let link = input.find("https://").or_else(|| input.find("http://"))
+        .and_then(|index| input[index..].split_whitespace().next())
+        .or_else(|| input.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with("提取码")))
+        .unwrap_or_default();
+    let mut refs = parse_share_entries(link);
+    if refs.len() != 1 {
+        return Err("请填写一个有效的移动云盘分享链接或分享 ID".into());
+    }
+    let reference = refs.pop().unwrap();
+    if !reference.link_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Err("分享 ID 格式无效".into());
+    }
+    let password = code.unwrap_or(&reference.password);
+    if !password.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("提取码格式无效".into());
+    }
+    Ok(format!("{}#{password}", reference.link_id))
+}
+
+pub fn saved_share_inputs(input: &str) -> Vec<String> {
+    parse_share_entries(input).into_iter()
+        .filter_map(|reference| normalize_share_input(&format!("{}#{}", reference.link_id, reference.password)).ok())
+        .collect()
+}
+
 fn parse_share_entries(input: &str) -> Vec<ShareRef> {
     input
         .split([',', ';', '\n', '\r'])
@@ -1611,6 +1931,39 @@ mod tests {
         assert_eq!(refs[0].link_id, "example");
         assert_eq!(refs[0].password, "5678");
         assert_eq!(refs[1].password, "1234");
+    }
+
+    #[test]
+    fn share_inputs_keep_extraction_code_and_provider_node_ids() {
+        assert_eq!(
+            normalize_share_input("分享文件\n链接：https://yun.139.com/shareweb/#/w/i/example\n提取码： aB12\n复制本段信息").unwrap(),
+            "example#aB12",
+        );
+        assert_eq!(normalize_share_input("提取码：1234\nexample").unwrap(), "example#1234");
+        assert_eq!(share_node_id(&json!({"caID":"directory"}), true).unwrap(), "directory");
+        assert_eq!(share_node_id(&json!({"coID":"file"}), false).unwrap(), "file");
+        assert!(share_node_id(&json!({"caName":"目录"}), true).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires CMCLOUD_TEST_SHARE and access to the 139 share API"]
+    async fn live_share_lists_shared_folder() {
+        let input = std::env::var("CMCLOUD_TEST_SHARE").expect("Set CMCLOUD_TEST_SHARE");
+        let cloud = CloudClient::new(AccountConfig {
+            space: "share".into(),
+            root_id: "root".into(),
+            link_id: normalize_share_input(&input).unwrap(),
+            ..Default::default()
+        }).unwrap();
+        let mut root = cloud.root().await;
+        root.source_id = Some("test-source".into());
+        let title = cloud.share_title().await.unwrap();
+        let page = cloud.list_page(&root, None).await.unwrap();
+        let folder = page.files.iter().find(|file| file.is_dir).expect("shared folder");
+        let nested = cloud.list_page(folder, None).await.unwrap();
+        assert!(!nested.files.is_empty());
+        assert!(nested.files.iter().all(|item| !item.id.is_empty() && item.id != folder.id));
+        println!("{} · {} root entries, {} nested entries", title, page.files.len(), nested.files.len());
     }
 }
 

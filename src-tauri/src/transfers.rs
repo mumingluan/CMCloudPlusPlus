@@ -1,6 +1,7 @@
 use crate::{
     cloud::{CloudClient, CloudFile, UploadPlan},
     store::Store,
+    transfer_activity::{ActivityJob, TransferActivity, TransferOverview},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
@@ -17,7 +18,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+use crate::repositories::queue::RepositoryTransfer;
+#[path = "openlist_crypt_transfers.rs"]
+mod crypt_transfers;
+pub(crate) use crypt_transfers::{CryptTransfer, SpecialTransfer};
 #[cfg(target_os = "android")]
 use tauri_plugin_document_picker::{DocumentPickerExt, ForegroundStatus};
 use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
@@ -32,7 +37,7 @@ const MAX_CONCURRENCY: usize = 8;
 const MAX_BATCH: usize = 10_000;
 const MAX_QUEUE: usize = 100_000;
 const IO_BUFFER: usize = 1024 * 1024;
-const JOB_COLUMNS: &str = "id,direction,remote_json,local_path,name,total_bytes,completed_bytes,status,error,created_at,updated_at,attempts";
+const JOB_COLUMNS: &str = "id,direction,remote_json,local_path,name,total_bytes,completed_bytes,status,error,created_at,updated_at,attempts,repository_state IS NOT NULL";
 // Uploads may reuse a source in another account. Downloads must reserve their
 // local destination globally, including against an upload still reading it.
 const PATH_CONFLICT_QUERY: &str = "SELECT 1 FROM transfers WHERE local_path=?1 AND status NOT IN ('completed','cancelled') AND (?2='download' OR direction='download' OR account_scope=?3) LIMIT 1";
@@ -58,6 +63,8 @@ pub struct TransferSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferJob {
+    #[serde(default)]
+    pub repository: bool,
     pub id: String,
     pub direction: TransferDirection,
     pub remote: CloudFile,
@@ -95,20 +102,43 @@ struct UploadJournal {
 #[derive(Serialize, Deserialize, Default)]
 struct DownloadJournal {
     validator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication: Option<DownloadPublication>,
 }
 
-struct Control {
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct DownloadPublication {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+}
+
+#[cfg(target_os = "android")]
+fn download_identity(metadata: &std::fs::Metadata) -> DownloadPublication {
+    use std::os::unix::fs::MetadataExt;
+    DownloadPublication {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        bytes: metadata.len(),
+    }
+}
+
+pub(crate) struct Control {
     action: AtomicU8,
+    resume_after_stop: AtomicBool,
     changed: Notify,
+    cancellations:Mutex<Vec<Arc<AtomicBool>>>,
 }
 impl Control {
     fn new() -> Self {
         Self {
             action: AtomicU8::new(0),
+            resume_after_stop: AtomicBool::new(false),
             changed: Notify::new(),
+            cancellations:Mutex::new(vec![]),
         }
     }
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         match self.action.load(Ordering::Acquire) {
             1 => Err("已暂停".into()),
             2 => Err("已取消".into()),
@@ -116,9 +146,12 @@ impl Control {
         }
     }
     fn set(&self, action: u8) {
+        self.resume_after_stop.store(false, Ordering::Release);
         self.action.store(action, Ordering::Release);
+        if let Ok(flags)=self.cancellations.lock(){for flag in flags.iter(){flag.store(true,Ordering::Release)}}
         self.changed.notify_one();
     }
+    pub(crate) fn attach_cancel(&self,flag:Arc<AtomicBool>)->Result<(),String>{let mut flags=self.cancellations.lock().map_err(|_|"传输控制不可用")?;if self.action.load(Ordering::Acquire)!=0{flag.store(true,Ordering::Release)}flags.push(flag);Ok(())}
 }
 
 pub struct TransferManager {
@@ -127,6 +160,7 @@ pub struct TransferManager {
     client: RwLock<Option<(CloudClient, String)>>,
     http: reqwest::Client,
     active: Mutex<HashMap<String, Arc<Control>>>,
+    activity: Arc<Mutex<TransferActivity>>,
     changed: Notify,
     #[cfg(target_os = "android")]
     foreground_changed: Notify,
@@ -149,6 +183,7 @@ impl TransferManager {
                 .build()
                 .expect("TLS client initialization"),
             active: Mutex::new(HashMap::new()),
+            activity: Arc::new(Mutex::new(TransferActivity::default())),
             changed: Notify::new(),
             #[cfg(target_os = "android")]
             foreground_changed: Notify::new(),
@@ -173,6 +208,9 @@ impl TransferManager {
         // Switching sessions must stop existing requests before the next account runs.
         let mut session = self.client.write().await;
         if session.as_ref().map(|(_, existing)| existing.as_str()) != Some(scope.as_str()) {
+            if let Ok(mut activity) = self.activity.lock() {
+                activity.clear();
+            }
             if let Ok(active) = self.active.lock() {
                 for control in active.values() {
                     control.set(1);
@@ -221,11 +259,26 @@ impl TransferManager {
 
     /// Preparation opens files without reading their contents; inserts occur in one transaction.
     pub async fn enqueue(&self, specs: Vec<TransferSpec>) -> Result<Vec<TransferJob>, String> {
+        let intents=vec![None;specs.len()];self.enqueue_with_repository(specs,intents).await
+    }
+    pub(crate) async fn enqueue_with_repository(&self,specs:Vec<TransferSpec>,intents:Vec<Option<RepositoryTransfer>>)->Result<Vec<TransferJob>,String>{
+        let mapped = intents.into_iter().map(|i| i.map(SpecialTransfer::Repository)).collect();
+        self.enqueue_with_special(specs, mapped).await
+    }
+    pub(crate) async fn enqueue_with_special(&self,specs:Vec<TransferSpec>,intents:Vec<Option<SpecialTransfer>>)->Result<Vec<TransferJob>,String>{
+        if specs.len()!=intents.len(){return Err("加密或对象库传输批次无效".into())}
         if specs.is_empty() {
             return Ok(Vec::new());
         }
         if specs.len() > MAX_BATCH {
             return Err("每批最多添加 10,000 项，请分批添加".into());
+        }
+        #[cfg(target_os = "android")]
+        if specs.iter().zip(&intents).any(|(spec, intent)| {
+            spec.direction == TransferDirection::Download
+                && intent.as_ref().and_then(SpecialTransfer::preview_path).is_none()
+        }) {
+            self.app.document_picker().ensure_shared_downloads().await?;
         }
         let scope = self
             .client
@@ -236,9 +289,9 @@ impl TransferManager {
             .ok_or("请先连接云盘账号")?;
         let mut jobs = Vec::with_capacity(specs.len());
         let mut local_targets = HashSet::new();
-        for spec in specs {
+        for (spec,intent) in specs.into_iter().zip(&intents) {
             validate_source(&spec)?;
-            let (name, size) = if spec.direction == TransferDirection::Upload {
+            let (name, size) = if let Some(intent)=intent {intent.queue_size_name(&spec)?} else if spec.direction == TransferDirection::Upload {
                 let file = self.open_source(&spec.local_path).await?;
                 let metadata = file.metadata().await.map_err(|e| e.to_string())?;
                 if !metadata.is_file() {
@@ -272,6 +325,7 @@ impl TransferManager {
             }
             let time = now();
             jobs.push(TransferJob {
+                repository:intent.is_some(),
                 id: uuid::Uuid::new_v4().to_string(),
                 direction: spec.direction,
                 remote: spec.remote,
@@ -287,6 +341,7 @@ impl TransferManager {
                 speed: 0.0,
             });
         }
+        let sealed_intents=intents.iter().map(|intent|intent.as_ref().map(|v|serde_json::to_vec(v).map_err(|_|"对象库传输编码失败".to_string()).and_then(|raw|{if raw.len()>32<<20{return Err("对象库传输批次过大，请分批添加".into())}self.store.encrypt(&raw).map(|bytes|STANDARD.encode(bytes))})).transpose()).collect::<Result<Vec<_>,_>>()?;
         {
             let session = self.client.read().await;
             if session.as_ref().map(|(_, current)| current.as_str()) != Some(scope.as_str()) {
@@ -312,8 +367,8 @@ impl TransferManager {
                 let mut duplicate = transaction
                     .prepare(PATH_CONFLICT_QUERY)
                     .map_err(|e| e.to_string())?;
-                let mut insert = transaction.prepare("INSERT INTO transfers(id,direction,remote_json,local_path,name,total_bytes,status,created_at,updated_at,account_scope) VALUES(?,?,?,?,?,?,'queued',?,?,?)").map_err(|e| e.to_string())?;
-                for job in &jobs {
+                let mut insert = transaction.prepare("INSERT INTO transfers(id,direction,remote_json,local_path,name,total_bytes,status,created_at,updated_at,account_scope,repository_state,repository_preview) VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?)").map_err(|e| e.to_string())?;
+                for ((job,intent),original) in jobs.iter().zip(&sealed_intents).zip(&intents) {
                     if duplicate
                         .query_row(
                             params![&job.local_path, direction_str(job.direction), &scope],
@@ -336,11 +391,16 @@ impl TransferManager {
                             job.created_at,
                             job.updated_at,
                             scope,
+                            intent,
+                            original.as_ref().is_some_and(|intent|intent.preview_path().is_some()),
                         ])
                         .map_err(|e| e.to_string())?;
                 }
             }
             transaction.commit().map_err(|e| e.to_string())?;
+            if let Ok(mut activity) = self.activity.lock() {
+                activity.observe(jobs.iter().map(activity_job).collect());
+            }
         }
         self.notify_workers();
         let _ = self
@@ -349,8 +409,32 @@ impl TransferManager {
         Ok(jobs)
     }
 
-    pub fn list(&self, limit: usize, offset: usize) -> Result<Vec<TransferJob>, String> {
-        self.list_filtered(limit, offset, "all")
+    pub(crate) fn get(&self,id:&str)->Result<TransferJob,String>{
+        self.store.db.lock().map_err(|_|"传输数据库不可用")?.query_row(&format!("SELECT {JOB_COLUMNS} FROM transfers WHERE id=?"),[id],read_job).map_err(|_|"传输任务不存在".into())
+    }
+    pub(crate) fn is_active(&self,id:&str)->Result<bool,String>{Ok(self.active.lock().map_err(|_|"传输状态不可用")?.contains_key(id))}
+    fn preview_output(&self,id:&str)->Result<Option<PathBuf>,String>{
+        let encoded:Option<String>=self.store.db.lock().map_err(|_|"传输数据库不可用")?.query_row("SELECT repository_state FROM transfers WHERE id=?",[id],|row|row.get(0)).optional().map_err(|_|"预览状态不可用")?.flatten();
+        let Some(encoded)=encoded else{return Ok(None)};if encoded.len()>48<<20{return Err("传输断点过大".into())}
+        let raw=zeroize::Zeroizing::new(self.store.decrypt(&STANDARD.decode(encoded).map_err(|_|"预览断点已损坏")?)?);
+        let intent:SpecialTransfer=serde_json::from_slice(&raw).map_err(|_|"预览断点已损坏")?;
+        Ok(intent.preview_path().map(PathBuf::from))
+    }
+    pub(crate) fn discard_preview(&self,id:&str,root:&Path)->Result<(),String>{
+        if self.is_active(id)?{return Err("预览仍在停止".into())}
+        let Some(path)=self.preview_output(id)? else{return Ok(())};
+        let relative=path.strip_prefix(root).map_err(|_|"预览缓存身份无效")?;
+        let parts=relative.components().collect::<Vec<_>>();
+        if parts.len()!=2||parts.iter().any(|part|!matches!(part,std::path::Component::Normal(_)))||uuid::Uuid::parse_str(&parts[0].as_os_str().to_string_lossy()).is_err(){return Err("预览缓存路径无效".into())}
+        for ancestor in path.ancestors(){if let Ok(meta)=std::fs::symlink_metadata(ancestor){if crate::repositories::cache::reparse(&meta){return Err("预览缓存含链接".into())}}}
+        if path.exists(){std::fs::remove_file(&path).map_err(|_|"预览缓存未能清除，请在下次启动时重试")?;}
+        if let Some(parent)=path.parent(){if parent.exists(){std::fs::remove_dir(parent).map_err(|_|"预览临时目录未能回收")?;}}
+        self.store.db.lock().map_err(|_|"传输数据库不可用")?.execute("DELETE FROM transfers WHERE id=?",[id]).map_err(|_|"预览任务未能回收")?;
+        self.emit_changed(id);Ok(())
+    }
+    pub(crate) fn discard_previews_on_start(&self,root:&Path)->Result<(),String>{
+        let ids={let db=self.store.db.lock().map_err(|_|"传输数据库不可用")?;let mut query=db.prepare("SELECT id FROM transfers WHERE repository_preview=1").map_err(|_|"预览列表不可用")?;let rows=query.query_map([],|row|row.get::<_,String>(0)).map_err(|_|"预览列表不可用")?.collect::<Result<Vec<_>,_>>().map_err(|_|"预览列表不可用")?;rows};
+        for id in ids{self.discard_preview(&id,root)?;}Ok(())
     }
 
     pub fn list_filtered(
@@ -364,12 +448,7 @@ impl TransferManager {
             .db
             .lock()
             .map_err(|_| "传输数据库不可用".to_string())?;
-        let (predicate,order)=match filter {
-            "active"=>("WHERE status NOT IN ('completed','cancelled')","CASE status WHEN 'running' THEN 0 WHEN 'failed' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END,created_at DESC,rowid DESC"),
-            "completed"=>("WHERE status IN ('completed','cancelled')","created_at DESC,rowid DESC"),
-            "all"=>("","created_at DESC,rowid DESC"),
-            _=>return Err("不支持的传输筛选条件".into()),
-        };
+        let (predicate, order) = transfer_filter(filter)?;
         let mut query = db
             .prepare(&format!(
                 "SELECT {JOB_COLUMNS} FROM transfers {predicate} ORDER BY {order} LIMIT ? OFFSET ?"
@@ -385,6 +464,149 @@ impl TransferManager {
     pub fn pause(&self, id: &str) -> Result<(), String> {
         self.control(id, "paused", 1)
     }
+
+    pub fn pause_all(&self) -> Result<(), String> {
+        let db = self.store.db.lock().map_err(|_| "传输数据库不可用")?;
+        db.execute("UPDATE transfers SET status='paused',error=NULL,updated_at=? WHERE status IN ('running','queued')", [now()]).map_err(|e| e.to_string())?;
+        if let Ok(active) = self.active.lock() {
+            for control in active.values() {
+                control.set(1);
+            }
+        }
+        drop(db);
+        self.notify_workers();
+        self.emit_changed("");
+        Ok(())
+    }
+
+    pub async fn resume_all(&self) -> Result<(), String> {
+        let session = self.client.read().await;
+        let scope = &session.as_ref().ok_or("请先连接云盘账号")?.1;
+        let mut db = self.store.db.lock().map_err(|_| "传输数据库不可用")?;
+        let active = self.active.lock().map_err(|_| "传输状态不可用")?;
+        // A paused worker can still be unwinding an in-flight request. Resume it
+        // only after its checkpoint and cleanup complete, never run the ID twice.
+        for control in active.values() {
+            if control.action.load(Ordering::Acquire) == 1 {
+                control.resume_after_stop.store(true, Ordering::Release);
+            }
+        }
+        resume_scope(&mut db, scope, &active.keys().cloned().collect())?;
+        drop(active);
+        drop(db);
+        self.notify_workers();
+        self.emit_changed("");
+        Ok(())
+    }
+
+    pub async fn control_batch(
+        &self,
+        action: &str,
+        direction: Option<&str>,
+    ) -> Result<usize, String> {
+        use crate::batch_control::{self, BatchAction};
+        let action = BatchAction::parse(action)?;
+        let session = self.client.read().await;
+        let account = if action == BatchAction::Resume {
+            Some(session.as_ref().ok_or("请先连接云盘账号")?.1.as_str())
+        } else {
+            None
+        };
+        #[cfg(target_os = "android")]
+        let mut shared_cleanup = Vec::new();
+        let (count, cleanup) = {
+            let mut db = self.store.db.lock().map_err(|_| "传输数据库不可用")?;
+            let active = self.active.lock().map_err(|_| "传输状态不可用")?;
+            let targets = batch_control::apply(
+                &mut db,
+                action,
+                direction,
+                account,
+                &active.keys().cloned().collect(),
+            )?;
+            let mut cleanup = Vec::new();
+            for target in &targets {
+                if let Some(control) = active.get(&target.id) {
+                    match action {
+                        BatchAction::Pause => control.set(1),
+                        BatchAction::Cancel => control.set(2),
+                        BatchAction::Resume => {
+                            control.resume_after_stop.store(true, Ordering::Release)
+                        }
+                    }
+                } else if action == BatchAction::Cancel && target.download {
+                    cleanup.push(part_path(&target.path, &target.id));
+                    #[cfg(target_os = "android")]
+                    if let Ok(Some(uri)) = db.query_row(
+                        "SELECT shared_download_uri FROM transfers WHERE id=?", [&target.id],
+                        |row| row.get::<_, Option<String>>(0))
+                    {
+                        shared_cleanup.push((target.path.clone(), uri));
+                    }
+                }
+            }
+            if let Ok(mut activity) = self.activity.lock() {
+                for target in &targets {
+                    let status = match action {
+                        BatchAction::Pause => "paused",
+                        BatchAction::Cancel => "cancelled",
+                        BatchAction::Resume if active.contains_key(&target.id) => "paused",
+                        BatchAction::Resume => "queued",
+                    };
+                    activity.set_status(&target.id, status);
+                }
+            }
+            (targets.len(), cleanup)
+        };
+        drop(session);
+        let mut cleanup_errors = 0usize;
+        for path in cleanup {
+            if let Err(error) = fs::remove_file(path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    cleanup_errors += 1;
+                }
+            }
+        }
+        #[cfg(target_os = "android")]
+        for (path, uri) in shared_cleanup {
+            if discard_shared_stage(&self.app, &path, &uri).await.is_err() {
+                cleanup_errors += 1;
+            }
+        }
+        self.notify_workers();
+        self.emit_changed("");
+        if cleanup_errors > 0 {
+            return Err(format!(
+                "任务已取消，但有 {cleanup_errors} 个下载临时文件未能清理"
+            ));
+        }
+        Ok(count)
+    }
+
+    pub async fn overview(&self) -> Result<TransferOverview, String> {
+        let session = self.client.read().await;
+        let Some((_, scope)) = session.as_ref() else {
+            return Ok(TransferOverview::default());
+        };
+        let db = self.store.db.lock().map_err(|_| "传输数据库不可用")?;
+        let mut query = db.prepare("SELECT id,direction,total_bytes,completed_bytes,status FROM transfers WHERE account_scope=? AND status NOT IN ('completed','cancelled')").map_err(|e| e.to_string())?;
+        let jobs = query
+            .query_map([scope], |row| {
+                Ok(ActivityJob {
+                    id: row.get(0)?,
+                    upload: row.get::<_, String>(1)? == "upload",
+                    total: row.get(2)?,
+                    completed: row.get(3)?,
+                    status: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut activity = self.activity.lock().map_err(|_| "传输统计不可用")?;
+        activity.observe(jobs);
+        Ok(activity.overview())
+    }
     pub fn cancel(&self, id: &str) -> Result<(), String> {
         self.control(id, "cancelled", 2)?;
         if !self
@@ -398,15 +620,26 @@ impl TransferManager {
                 .db
                 .lock()
                 .map_err(|_| "传输数据库不可用".to_string())?;
-            let (path, direction): (String, String) = db
+            let (path, direction, uri): (String, String, Option<String>) = db
                 .query_row(
-                    "SELECT local_path,direction FROM transfers WHERE id=?",
+                    "SELECT local_path,direction,shared_download_uri FROM transfers WHERE id=?",
                     [id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .map_err(|e| e.to_string())?;
+            #[cfg(not(target_os = "android"))]
+            let _ = uri;
             if direction == "download" {
                 let _ = std::fs::remove_file(part_path(&path, id));
+                #[cfg(target_os = "android")]
+                if let Some(uri) = uri {
+                    let app = self.app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = discard_shared_stage(&app, &path, &uri).await {
+                            eprintln!("下载暂存清理失败：{error}");
+                        }
+                    });
+                }
             }
         }
         Ok(())
@@ -439,19 +672,92 @@ impl TransferManager {
     pub fn retry(&self, id: &str) -> Result<(), String> {
         self.resume(id)
     }
+    pub(crate) async fn quiesce_repositories(&self)->Result<(),String>{
+        let ids={let db=self.store.db.lock().map_err(|_|"传输数据库不可用")?;let mut query=db.prepare("SELECT id FROM transfers WHERE repository_state IS NOT NULL AND status NOT IN ('completed','cancelled')").map_err(|_|"对象库传输列表不可用")?;let rows=query.query_map([],|row|row.get::<_,String>(0)).map_err(|_|"对象库传输列表不可用")?.collect::<Result<Vec<_>,_>>().map_err(|_|"对象库传输列表不可用")?;rows};
+        for id in &ids{self.pause(id)?;}
+        let deadline=Instant::now()+Duration::from_secs(120);
+        loop{let active=self.active.lock().map_err(|_|"对象库传输控制不可用")?.keys().any(|id|ids.contains(id));if !active{return Ok(())}if Instant::now()>=deadline{return Err("对象库传输正在停止，请稍后再清除凭据".into())}tokio::time::sleep(Duration::from_millis(100)).await;}
+    }
     pub fn remove_finished(&self) -> Result<usize, String> {
-        self.store.clear_completed()
+        let count = self.store.clear_completed()?;
+        self.emit_changed("");
+        Ok(count)
+    }
+
+    pub fn remove_completed(&self, id: &str) -> Result<(), String> {
+        self.store.remove_completed(id)?;
+        self.emit_changed(id);
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    fn shared_download_info(&self, id: &str) -> Result<(Option<String>, bool), String> {
+        self.store.db.lock().map_err(|_| "传输数据库不可用".to_string())?
+            .query_row("SELECT shared_download_uri,repository_preview FROM transfers WHERE id=?", [id],
+                |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "android")]
+    async fn publish_shared_download(&self, job: &TransferJob) -> Result<Option<String>, String> {
+        let (previous, preview) = self.shared_download_info(&job.id)?;
+        if preview || Path::new(&job.local_path).is_dir() {
+            return Ok(None);
+        }
+        let root = self.app.path().app_data_dir().map_err(|e| e.to_string())?.join("Downloads");
+        let parent = Path::new(&job.local_path).parent().ok_or("下载路径无效")?;
+        let relative = parent.strip_prefix(&root).map_err(|_| "下载暂存路径无效")?;
+        let mut folders = relative.iter();
+        if job.repository && relative.starts_with("AxuanStor") {
+            folders.next();
+            folders.next(); // The repository queue uses a private per-batch directory.
+        }
+        let folder = folders.map(|part| part.to_string_lossy()).collect::<Vec<_>>().join("/");
+        let durable = self.saved_completed(&job.id)?;
+        self.progress(job, durable, durable, 0.0, "publishing");
+        let picker = self.app.document_picker();
+        let uri = picker.prepare_shared_download(&job.local_path, &folder, previous.as_deref()).await?;
+        let saved = self.store.db.lock().ok().and_then(|db| {
+            db.execute("UPDATE transfers SET shared_download_uri=? WHERE id=?", params![uri, job.id]).ok()
+        }) == Some(1);
+        if !saved {
+            if previous.as_deref() != Some(&uri) {
+                let _ = picker.discard_shared_download(&uri).await;
+            }
+            return Err("无法保存公共下载记录".into());
+        }
+        picker.finish_shared_download(&job.local_path, &uri).await?;
+        Ok(Some(uri))
+    }
+
+    #[cfg(target_os = "android")]
+    fn cleanup_shared_stage(&self, id: &str, path: &str, uri: &str) {
+        let Ok(root) = self.app.path().app_data_dir() else { return; };
+        if !Path::new(path).starts_with(root.join("Downloads")) { return; }
+        if let Ok(db) = self.store.db.lock() {
+            let reserved = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM transfers WHERE local_path=? AND id<>? AND status NOT IN ('completed','cancelled'))",
+                params![path, id], |row| row.get::<_, bool>(0)).unwrap_or(true);
+            if !reserved {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(_) => return,
+                }
+            }
+            let _ = db.execute("UPDATE transfers SET local_path=? WHERE id=? AND local_path=? AND status='completed'",
+                params![uri, id, path]);
+        }
     }
 
     async fn cleanup_completed_parts(&self) {
         let mut offset = 0usize;
         loop {
-            let paths: Vec<(String, String)> = {
+            let paths: Vec<(String, String, Option<String>)> = {
                 let Ok(db) = self.store.db.lock() else {
                     return;
                 };
-                let Ok(mut query)=db.prepare("SELECT id,local_path FROM transfers WHERE direction='download' AND status='completed' ORDER BY rowid LIMIT 500 OFFSET ?") else { return; };
-                let Ok(rows) = query.query_map([offset], |row| Ok((row.get(0)?, row.get(1)?)))
+                let Ok(mut query)=db.prepare("SELECT id,local_path,shared_download_uri FROM transfers WHERE direction='download' AND status='completed' ORDER BY rowid LIMIT 500 OFFSET ?") else { return; };
+                let Ok(rows) = query.query_map([offset], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 else {
                     return;
                 };
@@ -464,7 +770,16 @@ impl TransferManager {
                 return;
             }
             offset += paths.len();
-            for (id, path) in paths {
+            for (id, path, uri) in paths {
+                #[cfg(target_os = "android")]
+                if let Some(uri) = &uri {
+                    if path != *uri {
+                        self.cleanup_shared_stage(&id, &path, uri);
+                    }
+                    continue;
+                }
+                #[cfg(not(target_os = "android"))]
+                let _ = uri;
                 let temporary = part_path(&path, &id);
                 if same_file(&temporary, Path::new(&path)) {
                     let _ = fs::remove_file(temporary).await;
@@ -497,14 +812,25 @@ impl TransferManager {
                 .map(|(_, scope)| scope.clone());
             let queued = scope.is_some_and(|scope| self.store.db.lock().ok().and_then(|db| db.query_row("SELECT EXISTS(SELECT 1 FROM transfers WHERE account_scope=? AND status='queued' LIMIT 1)",[scope],|row|row.get::<_,bool>(0)).ok()).unwrap_or(false));
             if running || queued {
-                if last_attempt.is_none_or(|attempt| attempt.elapsed() >= Duration::from_secs(30)) {
-                    let result = self.app.document_picker().begin_transfers().await;
+                if last_attempt.is_none_or(|attempt| attempt.elapsed() >= Duration::from_secs(10)) {
+                    let overview = self.overview().await.unwrap_or_default();
+                    let result = self
+                        .app
+                        .document_picker()
+                        .begin_transfers_with_status(
+                            serde_json::to_value(overview).unwrap_or_default(),
+                        )
+                        .await;
                     let status = result.unwrap_or_else(|error| ForegroundStatus {
                         supported: true,
                         active: false,
                         notification_permission: false,
+                        user_stopped: false,
                         reason: Some(redact_error(&error)),
                     });
+                    if status.user_stopped {
+                        let _ = self.pause_all();
+                    }
                     let _ = self.app.emit("foreground-status", status);
                     last_attempt = Some(Instant::now());
                 }
@@ -519,6 +845,7 @@ impl TransferManager {
                         supported: true,
                         active: false,
                         notification_permission: false,
+                        user_stopped: false,
                         reason: None,
                     });
                 if let Err(error) = end {
@@ -527,8 +854,8 @@ impl TransferManager {
                 let _ = self.app.emit("foreground-status", status);
             }
             let next = last_attempt
-                .map(|attempt| Duration::from_secs(30).saturating_sub(attempt.elapsed()))
-                .unwrap_or(Duration::from_secs(30))
+                .map(|attempt| Duration::from_secs(10).saturating_sub(attempt.elapsed()))
+                .unwrap_or(Duration::from_secs(10))
                 .max(Duration::from_millis(100));
             tokio::select! { _ = wake => {}, _ = tokio::time::sleep(next) => {} }
         }
@@ -547,6 +874,9 @@ impl TransferManager {
             .get(id)
         {
             control.set(action);
+        }
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.set_status(id, status);
         }
         self.emit_changed(id);
         self.notify_workers();
@@ -572,7 +902,12 @@ impl TransferManager {
                             if let Ok(mut active) = self.active.lock() {
                                 active.insert(job.id.clone(), control.clone());
                             }
-                            if self.status(&job.id).as_deref() != Ok("running") {
+                            let status = self.status(&job.id);
+                            if status.as_deref() == Ok("cancelled") {
+                                control.set(2);
+                            } else if status.as_deref() != Ok("running")
+                                && control.action.load(Ordering::Acquire) == 0
+                            {
                                 control.set(1);
                             }
                             let manager = self.clone();
@@ -620,47 +955,84 @@ impl TransferManager {
 
     async fn run(self: Arc<Self>, job: TransferJob, client: CloudClient, control: Arc<Control>) {
         self.emit_changed(&job.id);
-        let mut outcome = Err("传输未开始".to_string());
-        for attempt in 0..5u32 {
+        let mut outcome: Result<(), String>;
+        let mut attempt = 0u32;
+        #[cfg(target_os = "android")]
+        let mut shared_uri = None;
+        loop {
             if let Err(error) = control.check() {
                 outcome = Err(error);
                 break;
             }
-            outcome = match job.direction {
+            #[cfg(target_os = "android")]
+            let already_staged = job.direction == TransferDirection::Download &&
+                Path::new(&job.local_path).is_file() &&
+                self.shared_download_info(&job.id).is_ok_and(|(uri, preview)| !preview &&
+                    (uri.is_some() || (job.repository && self.saved_completed(&job.id).ok() == Some(job.total_bytes))));
+            #[cfg(not(target_os = "android"))]
+            let already_staged = false;
+            outcome = if already_staged {
+                Ok(())
+            } else if job.repository {
+                self.run_repository(&job,&client,&control).await
+            } else {match job.direction {
                 TransferDirection::Download => self.download(&job, &client, &control).await,
                 TransferDirection::Upload => self.upload(&job, &client, &control).await,
-            };
+            }};
+            #[cfg(target_os = "android")]
+            if outcome.is_ok() && job.direction == TransferDirection::Download {
+                outcome = match control.check() {
+                    Ok(()) => self.publish_shared_download(&job).await.map(|uri| shared_uri = uri),
+                    Err(error) => Err(error),
+                };
+            }
             if outcome.is_ok() || control.check().is_err() {
                 break;
             }
             let error = outcome.as_ref().err().cloned().unwrap_or_default();
             if let Ok(db) = self.store.db.lock() {
-                let _ = db.execute("UPDATE transfers SET attempts=?,error=?,updated_at=? WHERE id=? AND status='running'", params![attempt+1, redact_error(&error), now(), job.id]);
+                let _ = db.execute("UPDATE transfers SET attempts=?,error=?,updated_at=? WHERE id=? AND status='running'", params![attempt.saturating_add(1), redact_error(&error), now(), job.id]);
             }
             self.emit_changed(&job.id);
-            if attempt < 4 {
-                tokio::select! { _ = tokio::time::sleep(Duration::from_secs((1u64 << attempt) + rand::random::<u64>() % 2)) => {}, _ = control.changed.notified() => {} }
-            }
+            let Some(delay) = retry_delay(attempt, &error, cfg!(target_os = "android")) else {
+                break;
+            };
+            tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = control.changed.notified() => {} }
+            attempt = attempt.saturating_add(1);
         }
-        let (status, error) = match control.action.load(Ordering::Acquire) {
+        #[cfg(target_os = "android")]
+        let shared = shared_uri.is_some();
+        #[cfg(not(target_os = "android"))]
+        let shared = false;
+        let (status, error) = if shared { ("completed", None) } else { match control.action.load(Ordering::Acquire) {
             1 => ("paused", None),
             2 => ("cancelled", None),
             _ => match outcome {
                 Ok(()) => ("completed", None),
                 Err(error) => ("failed", Some(redact_error(&error))),
             },
-        };
+        }};
         let committed = if let Ok(db) = self.store.db.lock() {
-            db.execute("UPDATE transfers SET status=?,error=?,updated_at=? WHERE id=? AND status='running'", params![status, error, now(), job.id]).unwrap_or(0) > 0
+            db.execute("UPDATE transfers SET status=?,error=?,updated_at=? WHERE id=? AND (status='running' OR (? AND status IN ('paused','cancelled')))", params![status, error, now(), job.id, shared]).unwrap_or(0) > 0
         } else {
             false
         };
+        #[cfg(target_os = "android")]
+        if let Some(uri) = shared_uri.as_deref().filter(|_| committed) {
+            self.cleanup_shared_stage(&job.id, &job.local_path, uri);
+        } else if status == "cancelled" && job.direction == TransferDirection::Download {
+            if let Ok((Some(uri), false)) = self.shared_download_info(&job.id) {
+                if let Err(error) = discard_shared_stage(&self.app, &job.local_path, &uri).await {
+                    eprintln!("下载暂存清理失败：{error}");
+                }
+            }
+        }
         if job.direction == TransferDirection::Download
             && (control.action.load(Ordering::Acquire) == 2 || (status == "completed" && committed))
         {
             let _ = fs::remove_file(part_path(&job.local_path, &job.id)).await;
         }
-        if job.direction == TransferDirection::Upload && status == "completed" && committed {
+        if !job.repository && job.direction == TransferDirection::Upload && status == "completed" && committed {
             let cfg = client.account_config().await;
             let file = self
                 .journal(&job.id)
@@ -676,6 +1048,7 @@ impl TransferManager {
                     size: journal.plan.size,
                     modified_at: chrono::Utc::now().to_rfc3339(),
                     thumbnail: None,
+                    source_id: None,
                 });
             let _ = self.app.emit(
                 "directory-changed",
@@ -688,8 +1061,30 @@ impl TransferManager {
                 }),
             );
         }
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(&job.id);
+        {
+            let session = self.client.read().await;
+            if let Ok(db) = self.store.db.lock() {
+                if let Ok(mut active) = self.active.lock() {
+                    let stored_status: String = db
+                        .query_row(
+                            "SELECT status FROM transfers WHERE id=?",
+                            [&job.id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_else(|_| status.into());
+                    if matches!(stored_status.as_str(), "paused" | "failed")
+                        && control.resume_after_stop.swap(false, Ordering::AcqRel)
+                    {
+                        if let Some((_, scope)) = session.as_ref() {
+                            let _ = db.execute("UPDATE transfers SET status='queued',error=NULL,attempts=0,updated_at=? WHERE id=? AND account_scope=? AND status IN ('paused','failed')", params![now(), job.id, scope]);
+                        }
+                    }
+                    if let Ok(mut activity) = self.activity.lock() {
+                        activity.set_status(&job.id, &stored_status);
+                    }
+                    active.remove(&job.id);
+                }
+            }
         }
         self.emit_changed(&job.id);
         self.notify_workers();
@@ -704,14 +1099,22 @@ impl TransferManager {
         control.check()?;
         let destination = PathBuf::from(&job.local_path);
         let temporary = part_path(&job.local_path, &job.id);
+        let previous: DownloadJournal = self
+            .journal(&job.id)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         if destination.exists() {
             let durable = self.saved_completed(&job.id)?;
-            if same_file(&temporary, &destination)
-                && fs::metadata(&destination)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .len()
-                    == durable
+            let metadata = fs::metadata(&destination)
+                .await
+                .map_err(|e| e.to_string())?;
+            let published = same_file(&temporary, &destination);
+            #[cfg(target_os = "android")]
+            let published = published
+                || (!temporary.exists()
+                    && previous.publication.as_ref() == Some(&download_identity(&metadata)));
+            if published
+                && metadata.len() == durable
                 && (job.total_bytes == 0 || durable == job.total_bytes)
             {
                 self.progress(job, durable, durable, 0.0, "completed");
@@ -743,23 +1146,34 @@ impl TransferManager {
             return Err("断点文件大于云端文件，请取消后重新添加".into());
         }
         ensure_download_space(parent, job.total_bytes.saturating_sub(offset))?;
-        let previous: DownloadJournal = self
-            .journal(&job.id)?
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let link = client.link(&job.remote).await?;
-        control.check()?;
-        let mut request = self
-            .http
-            .get(link)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity");
-        if offset > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-            if let Some(value) = &previous.validator {
-                request = request.header(reqwest::header::IF_RANGE, value);
-            }
+        // A crash/pause can happen after the final durable checkpoint but before
+        // publishing. Requesting bytes=total- in that case only produces HTTP 416.
+        if download_checkpoint_complete(offset, job.total_bytes) {
+            control.check()?;
+            file.sync_all().await.map_err(|e| e.to_string())?;
+            drop(file);
+            self.publish_download(job, &temporary, &destination).await?;
+            self.checkpoint(&job.id, offset, offset)?;
+            self.progress(job, offset, offset, 0.0, "completed");
+            return Ok(());
         }
-        let response = tokio::select! { result = request.send() => result.map_err(|e| e.without_url().to_string())?, _ = control.changed.notified() => { control.check()?; return Err("请求已中止".into()); } };
+        let source_client;
+        let download_client = if let Some(id) = &job.remote.source_id {
+            let owner = client.account_config().await.id;
+            source_client = crate::sessions::Sessions::load(&self.store)?
+                .source(&owner, id, true)?.client(client).await?;
+            &source_client
+        } else {
+            client
+        };
+        let (response, request_offset) = download_with_fresh_link(
+            &self.http,
+            || download_client.link(&job.remote),
+            offset,
+            previous.validator.as_deref(),
+            control,
+        )
+        .await?;
         let status = response.status();
         if response
             .headers()
@@ -769,23 +1183,6 @@ impl TransferManager {
         {
             return Err("服务器返回了压缩编码，无法安全进行断点下载".into());
         }
-        if status.as_u16() == 416 && job.total_bytes > 0 && offset == job.total_bytes {
-            let declared = response
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|header| header.strip_prefix("bytes */"))
-                .and_then(|total| total.parse::<u64>().ok());
-            if declared == Some(offset) {
-                control.check()?;
-                file.sync_all().await.map_err(|e| e.to_string())?;
-                drop(file);
-                publish_download(&temporary, &destination).await?;
-                self.checkpoint(&job.id, offset, offset)?;
-                self.progress(job, offset, offset, 0.0, "completed");
-                return Ok(());
-            }
-        }
         if !status.is_success() {
             return Err(format!("下载请求返回 HTTP {}", status.as_u16()));
         }
@@ -793,12 +1190,12 @@ impl TransferManager {
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok());
-        let disposition =
-            resume_disposition(status.as_u16(), offset, content_range, job.total_bytes)?;
-        if disposition == ResumeDisposition::Restart {
-            file.set_len(0).await.map_err(|e| e.to_string())?;
-            offset = 0;
-        }
+        let disposition = resume_disposition(
+            status.as_u16(),
+            request_offset,
+            content_range,
+            job.total_bytes,
+        )?;
         let total = if let Some(range) = content_range {
             parse_content_range(range)?.2
         } else {
@@ -814,14 +1211,25 @@ impl TransferManager {
             .or_else(|| response.headers().get(reqwest::header::LAST_MODIFIED))
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        if disposition == ResumeDisposition::Append && offset > 0 {
+        if disposition == ResumeDisposition::Append && request_offset > 0 {
             if let (Some(old), Some(new)) = (&previous.validator, &validator) {
                 if old != new {
                     return Err("云端文件版本已变化，请重新添加任务".into());
                 }
             }
         }
-        self.save_journal(&job.id, &DownloadJournal { validator })?;
+        // Keep the durable partial file until the fresh response passes validation.
+        if disposition == ResumeDisposition::Restart || request_offset == 0 {
+            file.set_len(0).await.map_err(|e| e.to_string())?;
+            offset = 0;
+        }
+        self.save_journal(
+            &job.id,
+            &DownloadJournal {
+                validator,
+                publication: None,
+            },
+        )?;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(|e| e.to_string())?;
@@ -866,10 +1274,33 @@ impl TransferManager {
         control.check()?;
         self.checkpoint(&job.id, completed, completed)?;
         drop(file);
-        publish_download(&temporary, &destination).await?;
+        self.publish_download(job, &temporary, &destination).await?;
         self.checkpoint(&job.id, completed, completed)?;
         self.progress(job, completed, completed, 0.0, "completed");
         Ok(())
+    }
+
+    async fn publish_download(
+        &self,
+        _job: &TransferJob,
+        temporary: &Path,
+        destination: &Path,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "android")]
+        {
+            // Persist the source inode before rename. If the process stops after
+            // rename but before completion is committed, only this exact file
+            // can be accepted on recovery, never an unrelated existing file.
+            let mut journal: DownloadJournal = self
+                .journal(&_job.id)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            journal.publication = Some(download_identity(
+                &fs::metadata(temporary).await.map_err(|e| e.to_string())?,
+            ));
+            self.save_journal(&_job.id, &journal)?;
+        }
+        publish_download(temporary, destination).await
     }
 
     async fn upload(
@@ -978,26 +1409,23 @@ impl TransferManager {
             .saturating_mul(journal.plan.part_size)
             .min(size);
         self.checkpoint(&job.id, completed, size)?;
-        let mut start_number = journal.finished_parts + 1;
-        while start_number <= part_count {
+        let mut renewed_part = false;
+        'parts: while journal.finished_parts < part_count {
+            let start_number = journal.finished_parts + 1;
             control.check()?;
             // A batch of 100 URLs can expire long before its tail is reached on
             // a slow TB transfer. Refresh the next part just before sending it.
-            let count = 1;
             let parts = if start_number == 1 && first_part.is_some() {
                 vec![first_part.take().expect("checked initial upload part")]
             } else {
                 client
-                    .refresh_upload_parts(&journal.plan, start_number, count)
+                    .refresh_upload_parts(&journal.plan, start_number, 1)
                     .await?
             };
-            if parts.is_empty() {
-                return Err("云端未返回上传分片地址，请重试".into());
+            if parts.len() != 1 {
+                return Err("云端未返回请求的上传分片地址，请重试".into());
             }
             for part in parts {
-                if part.part_number <= journal.finished_parts {
-                    continue;
-                }
                 if part.part_number == 0
                     || part.part_number > part_count
                     || part.offset.saturating_add(part.size) > size
@@ -1024,6 +1452,7 @@ impl TransferManager {
                     .map_err(|e| e.to_string())?;
                 let stream = ReaderStream::with_capacity(source.take(part.size), 64 * 1024);
                 let manager_app = self.app.clone();
+                let transfer_activity = self.activity.clone();
                 let id = job.id.clone();
                 let stop = control.clone();
                 let baseline = completed;
@@ -1044,8 +1473,9 @@ impl TransferManager {
                             .store(activity_start.elapsed().as_secs(), Ordering::Relaxed);
                         sent += chunk.len() as u64;
                         if meter.ready() {
-                            let _ = manager_app.emit(
-                                "transfer-progress",
+                            publish_transfer_progress(
+                                &manager_app,
+                                &transfer_activity,
                                 TransferProgress {
                                     id: id.clone(),
                                     completed_bytes: baseline + sent,
@@ -1072,11 +1502,19 @@ impl TransferManager {
                         }
                     }
                 };
-                tokio::select! {
-                    result = client.upload_part(&part, body) => result?,
+                let result = tokio::select! {
+                    result = client.upload_part(&part, body) => result,
                     _ = stalled => return Err("上传超过 120 秒没有进展，保留已确认分片并自动重试".into()),
                     _ = control.changed.notified() => { control.check()?; return Err("上传已停止".into()); }
+                };
+                if matches!(&result, Err(crate::cloud::UploadPartError::Rejected(reqwest::StatusCode::FORBIDDEN)))
+                    && !renewed_part
+                {
+                    renewed_part = true;
+                    continue 'parts;
                 }
+                result?;
+                renewed_part = false;
                 control.check()?;
                 journal.finished_parts = part.part_number;
                 completed += part.size;
@@ -1084,7 +1522,6 @@ impl TransferManager {
                 self.checkpoint(&job.id, completed, size)?;
                 self.progress(job, completed, size, 0.0, "transferring");
             }
-            start_number += count as u64;
         }
         if journal.finished_parts != part_count {
             return Err("上传分片不完整，保留断点等待重试".into());
@@ -1107,7 +1544,7 @@ impl TransferManager {
         Ok(())
     }
 
-    async fn open_source(&self, path: &str) -> Result<fs::File, String> {
+    pub(crate) async fn open_source(&self, path: &str) -> Result<fs::File, String> {
         let app = self.app.clone();
         let path = path.to_owned();
         let file = tauri::async_runtime::spawn_blocking(move || {
@@ -1143,7 +1580,7 @@ impl TransferManager {
             )
             .map_err(|e| e.to_string())
     }
-    fn journal(&self, id: &str) -> Result<Option<String>, String> {
+    pub(crate) fn journal(&self, id: &str) -> Result<Option<String>, String> {
         let encrypted: Option<String> = self
             .store
             .db
@@ -1163,7 +1600,7 @@ impl TransferManager {
             })
             .transpose()
     }
-    fn save_journal<T: Serialize>(&self, id: &str, journal: &T) -> Result<(), String> {
+    pub(crate) fn save_journal<T: Serialize>(&self, id: &str, journal: &T) -> Result<(), String> {
         let data = STANDARD.encode(
             self.store
                 .encrypt(&serde_json::to_vec(journal).map_err(|e| e.to_string())?)?,
@@ -1179,7 +1616,7 @@ impl TransferManager {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    fn checkpoint(&self, id: &str, completed: u64, total: u64) -> Result<(), String> {
+    pub(crate) fn checkpoint(&self, id: &str, completed: u64, total: u64) -> Result<(), String> {
         self.store
             .db
             .lock()
@@ -1191,9 +1628,10 @@ impl TransferManager {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-    fn progress(&self, job: &TransferJob, completed: u64, total: u64, speed: f64, phase: &str) {
-        let _ = self.app.emit(
-            "transfer-progress",
+    pub(crate) fn progress(&self, job: &TransferJob, completed: u64, total: u64, speed: f64, phase: &str) {
+        publish_transfer_progress(
+            &self.app,
+            &self.activity,
             TransferProgress {
                 id: job.id.clone(),
                 completed_bytes: completed,
@@ -1208,6 +1646,143 @@ impl TransferManager {
             .app
             .emit("transfer-changed", serde_json::json!({ "id": id }));
     }
+    async fn run_repository(self:&Arc<Self>,job:&TransferJob,client:&CloudClient,control:&Arc<Control>)->Result<(),String>{
+        let encoded:String=self.store.db.lock().map_err(|_|"传输数据库不可用")?.query_row("SELECT repository_state FROM transfers WHERE id=?",[&job.id],|row|row.get(0)).map_err(|_|"传输断点不可用")?;
+        if encoded.len()>48<<20{return Err("传输断点过大".into())}
+        let raw=zeroize::Zeroizing::new(self.store.decrypt(&STANDARD.decode(encoded).map_err(|_|"传输断点已损坏")?)?);
+        let intent:SpecialTransfer=serde_json::from_slice(&raw).map_err(|_|"传输断点已损坏")?;
+        match intent {
+            SpecialTransfer::OpenListCrypt(crypt_intent) => {
+                self.run_crypt_transfer(job, client, control, crypt_intent).await
+            }
+            SpecialTransfer::Repository(repo_intent) => {
+                let repository=self.app.state::<Arc<crate::repositories::RepositoryManager>>().inner().clone();
+                crate::repositories::queue::run(repository,self.app.clone(),client.account_config().await,repo_intent,job.clone(),control.clone(),self.clone()).await
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn discard_shared_stage(app: &AppHandle, path: &str, uri: &str) -> Result<(), String> {
+    let root = app.path().app_data_dir().map_err(|e| e.to_string())?.join("Downloads");
+    let identity = if Path::new(path).starts_with(root) {
+        std::fs::metadata(path).ok().map(|meta| download_identity(&meta))
+    } else {
+        None
+    };
+    app.document_picker().discard_shared_download(uri).await?;
+    if identity.is_some() && identity == std::fs::metadata(path).ok().map(|meta| download_identity(&meta)) {
+        if let Err(error) = fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound { return Err(error.to_string()); }
+        }
+    }
+    Ok(())
+}
+
+// Upload body streams and regular checkpoints must update the same activity
+// sample before notifying the UI, so the overview and tray see live bandwidth.
+fn record_transfer_progress(activity: &Mutex<TransferActivity>, progress: &TransferProgress) {
+    if let Ok(mut activity) = activity.lock() {
+        activity.progress(
+            &progress.id,
+            progress.completed_bytes,
+            progress.total_bytes,
+            progress.speed,
+            &progress.phase,
+        );
+    }
+}
+
+fn publish_transfer_progress(
+    app: &AppHandle,
+    activity: &Mutex<TransferActivity>,
+    progress: TransferProgress,
+) {
+    record_transfer_progress(activity, &progress);
+    let _ = app.emit("transfer-progress", progress);
+}
+
+fn retry_delay(attempt: u32, error: &str, android: bool) -> Option<Duration> {
+    let lower = error.to_ascii_lowercase();
+    let transient = [
+        "connection",
+        "network",
+        "dns error",
+        "error sending request",
+        "timed out",
+        "timeout",
+        "http 429",
+        "http 5",
+        "网络",
+        "超时",
+        "没有进展",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if attempt >= 4 && !(android && transient) {
+        return None;
+    }
+    Some(Duration::from_secs(
+        (1u64 << attempt.min(5)).min(30) + rand::random::<u64>() % 2,
+    ))
+}
+
+fn transfer_filter(filter: &str) -> Result<(String, &'static str), String> {
+    let (base, errors) = filter
+        .strip_suffix(":errors")
+        .map_or((filter, false), |base| (base, true));
+    let condition = match base {
+        "upload_active" => "direction='upload' AND status NOT IN ('completed','cancelled')",
+        "upload_completed" => "direction='upload' AND status='completed'",
+        "download_active" => "direction='download' AND status NOT IN ('completed','cancelled')",
+        "download_completed" => "direction='download' AND status='completed'",
+        "active" => "status NOT IN ('completed','cancelled')",
+        "completed" => "status='completed'",
+        "all" => "1=1",
+        _ => return Err("不支持的传输筛选条件".into()),
+    };
+    let predicate = format!(
+        "WHERE {condition}{}",
+        if errors { " AND status='failed'" } else { "" }
+    );
+    Ok((predicate, "CASE status WHEN 'running' THEN 0 WHEN 'failed' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END,created_at DESC,rowid DESC"))
+}
+
+fn activity_job(job: &TransferJob) -> ActivityJob {
+    ActivityJob {
+        id: job.id.clone(),
+        upload: job.direction == TransferDirection::Upload,
+        total: job.total_bytes,
+        completed: job.completed_bytes,
+        status: job.status.clone(),
+    }
+}
+
+fn resume_scope(
+    db: &mut rusqlite::Connection,
+    scope: &str,
+    active: &HashSet<String>,
+) -> Result<usize, String> {
+    let transaction = db.transaction().map_err(|e| e.to_string())?;
+    let ids = {
+        let mut query = transaction
+            .prepare(
+                "SELECT id FROM transfers WHERE account_scope=? AND status IN ('paused','failed')",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = query
+            .query_map([scope], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let mut count = 0;
+    for id in ids.into_iter().filter(|id| !active.contains(id)) {
+        count += transaction.execute("UPDATE transfers SET status='queued',error=NULL,attempts=0,updated_at=? WHERE id=?", params![now(), id]).map_err(|e| e.to_string())?;
+    }
+    transaction.commit().map_err(|e| e.to_string())?;
+    Ok(count)
 }
 
 fn now() -> i64 {
@@ -1234,6 +1809,7 @@ fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferJob> {
     })?;
     let direction: String = row.get(1)?;
     Ok(TransferJob {
+        repository:row.get(12)?,
         id: row.get(0)?,
         direction: if direction == "upload" {
             TransferDirection::Upload
@@ -1388,40 +1964,80 @@ fn ensure_download_space(directory: &Path, remaining: u64) -> Result<(), String>
 }
 
 async fn publish_download(temporary: &Path, destination: &Path) -> Result<(), String> {
-    // Same-directory hard link publishes completed bytes atomically without replacing
-    // a destination. Windows FAT uses MoveFileEx without its replace-existing flag.
-    match fs::hard_link(temporary, destination).await {
-        // The link remains until SQLite confirms completion. If the process stops
-        // between publication and commit, matching file identities recover it.
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err("目标文件已经存在".into())
-        }
-        Err(error) => {
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::ffi::OsStrExt;
-                use windows_sys::Win32::Storage::FileSystem::{
-                    MoveFileExW, MOVEFILE_WRITE_THROUGH,
-                };
-                let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-                let to: Vec<u16> = destination
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(Some(0))
-                    .collect();
-                if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
-                    return Err(std::io::Error::last_os_error().to_string());
-                }
-                let _ = error;
-            }
-            #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "android")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from = CString::new(temporary.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let to = CString::new(destination.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        // Android SELinux rejects app hard links even in private storage.
+        // renameat2 publishes atomically and RENAME_NOREPLACE prevents overwrites.
+        // syscall also works on older Android versions without a bionic wrapper.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
             return Err(format!(
-                "当前文件系统无法安全发布完整下载，断点已保留：{error}"
+                "无法发布完整下载，断点已保留：{}",
+                std::io::Error::last_os_error()
             ));
         }
+        if let Some(parent) = destination.parent() {
+            fs::File::open(parent)
+                .await
+                .map_err(|e| e.to_string())?
+                .sync_all()
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(target_os = "android"))]
+    {
+        // Same-directory hard link publishes completed bytes atomically without replacing
+        // a destination. Windows FAT uses MoveFileEx without its replace-existing flag.
+        match fs::hard_link(temporary, destination).await {
+            // The link remains until SQLite confirms completion. If the process stops
+            // between publication and commit, matching file identities recover it.
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err("目标文件已经存在".into())
+            }
+            Err(error) => {
+                #[cfg(target_os = "windows")]
+                {
+                    use std::os::windows::ffi::OsStrExt;
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        MoveFileExW, MOVEFILE_WRITE_THROUGH,
+                    };
+                    let from: Vec<u16> =
+                        temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+                    let to: Vec<u16> = destination
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(Some(0))
+                        .collect();
+                    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) }
+                        == 0
+                    {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                    let _ = error;
+                }
+                #[cfg(not(target_os = "windows"))]
+                return Err(format!(
+                    "当前文件系统无法安全发布完整下载，断点已保留：{error}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn same_file(first: &Path, second: &Path) -> bool {
@@ -1457,6 +2073,73 @@ fn same_file(first: &Path, second: &Path) -> bool {
     {
         let _ = (first, second);
         false
+    }
+}
+
+fn download_checkpoint_complete(offset: u64, total: u64) -> bool {
+    total > 0 && offset == total
+}
+
+async fn download_with_fresh_link<F, Link>(
+    http: &reqwest::Client,
+    mut resolve: F,
+    offset: u64,
+    validator: Option<&str>,
+    control: &Control,
+) -> Result<(reqwest::Response, u64), String>
+where
+    F: FnMut() -> Link,
+    Link: std::future::Future<Output = Result<String, String>>,
+{
+    control.check()?;
+    let link = resolve().await?;
+    let result = download_response(http, &link, offset, validator, control).await?;
+    if matches!(
+        result.0.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        drop(result);
+        control.check()?;
+        let fresh = resolve().await?;
+        return download_response(http, &fresh, offset, validator, control).await;
+    }
+    Ok(result)
+}
+
+async fn download_response(
+    http: &reqwest::Client,
+    link: &str,
+    offset: u64,
+    validator: Option<&str>,
+    control: &Control,
+) -> Result<(reqwest::Response, u64), String> {
+    let mut request_offset = offset;
+    loop {
+        control.check()?;
+        let mut request = http
+            .get(link)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if request_offset > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={request_offset}-"));
+            if let Some(value) = validator {
+                request = request.header(reqwest::header::IF_RANGE, value);
+            }
+        }
+        let response = tokio::select! {
+            result = request.send() => result.map_err(|e| e.without_url().to_string())?,
+            _ = control.changed.notified() => {
+                control.check()?;
+                return Err("请求已中止".into());
+            }
+        };
+        // Some download nodes reject a saved range (sometimes without a
+        // Content-Range header). Retry once without Range/If-Range; the caller
+        // validates the response and restarts rather than appending its bytes.
+        if response.status().as_u16() == 416 && request_offset > 0 {
+            request_offset = 0;
+            continue;
+        }
+        return Ok((response, request_offset));
     }
 }
 
@@ -1577,6 +2260,61 @@ impl Meter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bulk_resume_preserves_accounts_and_waits_for_stopping_workers() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE transfers(id TEXT,status TEXT,account_scope TEXT,error TEXT,attempts INTEGER,updated_at INTEGER);
+          INSERT INTO transfers VALUES ('paused','paused','a','err',3,0),('failed','failed','a','err',3,0),('stopping','paused','a',NULL,0,0),('other','paused','b',NULL,0,0),('done','completed','a',NULL,0,0);").unwrap();
+        assert_eq!(
+            super::resume_scope(
+                &mut db,
+                "a",
+                &std::collections::HashSet::from(["stopping".into()])
+            )
+            .unwrap(),
+            2
+        );
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM transfers WHERE status='queued' AND error IS NULL AND attempts=0", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 2);
+        let paused: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM transfers WHERE status='paused'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paused, 2);
+    }
+    #[test]
+    fn android_network_retries_continue_but_permanent_errors_stop() {
+        assert!(super::retry_delay(20, "connection reset", true).is_some());
+        assert!(super::retry_delay(20, "HTTP 503", true).is_some());
+        assert!(super::retry_delay(20, "connection reset", false).is_none());
+        assert!(super::retry_delay(20, "本地文件已修改", true).is_none());
+    }
+    #[test]
+    fn transfer_categories_filter_before_pagination() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE transfers(direction TEXT,status TEXT); INSERT INTO transfers VALUES ('upload','running'),('upload','failed'),('upload','completed'),('download','failed'),('download','completed'),('download','cancelled');").unwrap();
+        for (filter, expected) in [
+            ("upload_active", 2),
+            ("upload_completed", 1),
+            ("download_active:errors", 1),
+            ("active", 3),
+            ("completed", 2),
+        ] {
+            let (predicate, _) = super::transfer_filter(filter).unwrap();
+            let count: i64 = db
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM transfers {predicate}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "{filter}");
+        }
+    }
+
     use super::*;
     #[test]
     fn account_switch_allows_shared_upload_sources_but_protects_download_targets() {
@@ -1598,6 +2336,179 @@ mod tests {
         assert!(conflict("destination", "download", "account-b"));
         assert!(!conflict("finished", "upload", "account-a"));
     }
+    #[test]
+    fn streamed_upload_samples_reach_the_overview_and_tray_accounting() {
+        let activity = Mutex::new(TransferActivity::default());
+        activity.lock().unwrap().observe(vec![
+            ActivityJob {
+                id: "upload-a".into(),
+                upload: true,
+                total: 1000,
+                completed: 0,
+                status: "running".into(),
+            },
+            ActivityJob {
+                id: "upload-b".into(),
+                upload: true,
+                total: 1000,
+                completed: 0,
+                status: "running".into(),
+            },
+            ActivityJob {
+                id: "download".into(),
+                upload: false,
+                total: 1000,
+                completed: 0,
+                status: "running".into(),
+            },
+        ]);
+        for (id, done, speed) in [
+            ("upload-a", 300, 252.0),
+            ("upload-b", 200, 107.0),
+            ("download", 400, 176.0),
+        ] {
+            record_transfer_progress(
+                &activity,
+                &TransferProgress {
+                    id: id.into(),
+                    completed_bytes: done,
+                    total_bytes: 1000,
+                    speed,
+                    phase: "transferring".into(),
+                },
+            );
+        }
+        // Periodic database observations must retain in-flight stream samples.
+        activity.lock().unwrap().observe(vec![ActivityJob {
+            id: "upload-a".into(),
+            upload: true,
+            total: 1000,
+            completed: 0,
+            status: "running".into(),
+        }]);
+        let totals = activity.lock().unwrap().overview();
+        assert_eq!(totals.upload_speed, 359.0);
+        assert_eq!(totals.download_speed, 176.0);
+        assert_eq!(totals.completed_bytes, 900);
+        activity.lock().unwrap().set_status("upload-a", "paused");
+        assert_eq!(activity.lock().unwrap().overview().upload_speed, 107.0);
+    }
+
+    #[test]
+    fn download_journal_preserves_publication_identity_and_accepts_legacy_checkpoints() {
+        let old: DownloadJournal = serde_json::from_str(r#"{"validator":"v1"}"#).unwrap();
+        assert!(old.publication.is_none());
+        let journal = DownloadJournal {
+            validator: old.validator,
+            publication: Some(DownloadPublication {
+                device: 7,
+                inode: 42,
+                bytes: 106561664,
+            }),
+        };
+        let recovered: DownloadJournal =
+            serde_json::from_str(&serde_json::to_string(&journal).unwrap()).unwrap();
+        assert_eq!(recovered.publication, journal.publication);
+        assert_ne!(
+            recovered.publication,
+            Some(DownloadPublication {
+                device: 7,
+                inode: 43,
+                bytes: 106561664
+            })
+        );
+    }
+
+    #[test]
+    fn fully_synced_download_can_publish_without_requesting_past_eof() {
+        assert!(download_checkpoint_complete(106561664, 106561664));
+        assert!(!download_checkpoint_complete(106561663, 106561664));
+        assert!(!download_checkpoint_complete(106561665, 106561664));
+        assert!(!download_checkpoint_complete(0, 0));
+    }
+
+    fn serve_download_responses(
+        replies: &'static [&str],
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new();
+                let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                    bytes.push(byte[0]);
+                }
+                requests.push(String::from_utf8(bytes).unwrap().to_lowercase());
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn rejected_resume_retries_once_without_range_or_validator() {
+        let (url, server) = serve_download_responses(&[
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+        ]);
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let (response, offset) = download_response(&http, &url, 3, Some("\"v1\""), &Control::new())
+            .await
+            .unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"data");
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains("range: bytes=3-\r\n"));
+        assert!(requests[0].contains("if-range: \"v1\"\r\n"));
+        assert!(!requests[1].contains("range:"));
+        assert!(requests[1].contains("accept-encoding: identity"));
+    }
+
+    #[tokio::test]
+    async fn expired_download_renews_link_and_keeps_range_and_validator() {
+        let (url, server) = serve_download_responses(&[
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-4/5\r\nContent-Length: 2\r\nConnection: close\r\n\r\nta",
+        ]);
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let mut links = ["expired", "renewed"].into_iter();
+        let (response, offset) = download_with_fresh_link(
+            &http,
+            || std::future::ready(Ok(format!("{url}?grant={}", links.next().unwrap()))),
+            3,
+            Some("\"v1\""),
+            &Control::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(offset, 3);
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ta");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("get /file?grant=expired "));
+        assert!(requests[1].starts_with("get /file?grant=renewed "));
+        for request in requests {
+            assert!(request.contains("range: bytes=3-\r\n"));
+            assert!(request.contains("if-range: \"v1\"\r\n"));
+        }
+    }
+
     #[test]
     fn server_ignoring_range_restarts_instead_of_appending() {
         assert_eq!(
@@ -1656,7 +2567,17 @@ mod tests {
         let existing = directory.join("existing.bin");
         fs::write(&partial, b"completed-file-bytes").await.unwrap();
         publish_download(&partial, &destination).await.unwrap();
+        #[cfg(not(target_os = "android"))]
         assert!(same_file(&partial, &destination));
+        #[cfg(target_os = "android")]
+        {
+            assert!(!partial.exists());
+            assert_eq!(
+                fs::read(&destination).await.unwrap(),
+                b"completed-file-bytes"
+            );
+            fs::write(&partial, b"completed-file-bytes").await.unwrap();
+        }
         fs::write(&existing, b"user-owned-file").await.unwrap();
         assert!(publish_download(&partial, &existing).await.is_err());
         assert_eq!(fs::read(existing).await.unwrap(), b"user-owned-file");

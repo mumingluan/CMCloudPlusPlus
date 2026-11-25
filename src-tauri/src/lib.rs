@@ -1,11 +1,26 @@
 mod auth;
+mod archive_format;
+mod file_preview;
+mod batch_control;
 mod cloud;
 mod official;
+mod openlist_crypt;
+mod openlist_crypt_cipher;
+mod openlist_crypt_media;
+mod repositories;
+mod repository_index;
 mod sessions;
 mod store;
+mod system_secrets;
+mod transfer_activity;
 mod transfers;
+#[cfg(desktop)]
+mod tray;
+#[cfg(desktop)]
+mod upload_paths;
 
-use cloud::{AccountConfig, CloudClient, CloudFile, FilePage, Quota, SpaceInfo};
+use cloud::{AccountConfig, CloudClient, CloudFile, FilePage, Quota};
+use sessions::BrowseSource;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -30,7 +45,9 @@ struct AppState {
     pending_login: RwLock<Option<AccountConfig>>,
     session: Mutex<()>,
     scan: Mutex<()>,
-    scan_cancel: AtomicBool,
+    scan_cancel: Arc<AtomicBool>,
+    #[cfg(desktop)]
+    tray_ready: AtomicBool,
     store: Arc<Store>,
     transfers: Arc<TransferManager>,
 }
@@ -40,6 +57,7 @@ struct AccountSummary {
     id: String,
     name: String,
     account: String,
+    phone: String,
     space: String,
     root_id: String,
     cloud_id: String,
@@ -63,6 +81,11 @@ fn summary(config: &AccountConfig) -> AccountSummary {
         id: config.id.clone(),
         name: config.name.clone(),
         account: masked,
+        phone: if account.len() == 11 && account.bytes().all(|c| c.is_ascii_digit()) {
+            account
+        } else {
+            String::new()
+        },
         space: config.space.clone(),
         root_id: config.root_id.clone(),
         cloud_id: config.cloud_id.clone(),
@@ -83,6 +106,21 @@ async fn client(state: &AppState) -> Result<CloudClient, String> {
         .clone()
         .ok_or_else(|| "请先连接移动云盘".into())
 }
+async fn file_client(state: &AppState, file: &CloudFile) -> Result<CloudClient, String> {
+    if let Some(id) = &file.source_id {
+        let account = client(state).await?;
+        let owner = account.account_config().await.id;
+        let vault = sessions::Sessions::load(&state.store)?;
+        return vault.source(&owner, id, false)?.client(&account).await;
+    }
+    client(state).await
+}
+fn require_writable(file: &CloudFile) -> Result<(), String> {
+    if file.source_id.is_some() {
+        return Err("群组与分享仅支持只读浏览".into());
+    }
+    Ok(())
+}
 async fn connect(state: &AppState, config: AccountConfig) -> Result<AccountSummary, String> {
     state.scan_cancel.store(true, Ordering::Release);
     let _guard = state.session.lock().await;
@@ -90,12 +128,21 @@ async fn connect(state: &AppState, config: AccountConfig) -> Result<AccountSumma
 }
 async fn connect_locked(
     state: &AppState,
+    config: AccountConfig,
+) -> Result<AccountSummary, String> {
+    activate_account(state, config, None).await
+}
+async fn activate_account(
+    state: &AppState,
     mut config: AccountConfig,
+    remove: Option<&str>,
 ) -> Result<AccountSummary, String> {
     state.scan_cancel.store(true, Ordering::Release);
+    config.keep_personal_space();
+    let mut vault = sessions::Sessions::load(&state.store)?;
     let adding = config.id.is_empty();
     if config.id.is_empty() {
-        config.id = sessions::Sessions::load(&state.store)?
+        config.id = vault
             .matching_id(&config)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     }
@@ -127,13 +174,17 @@ async fn connect_locked(
         }
     };
     if adding {
-        if let Some(id) = sessions::Sessions::load(&state.store)?.matching_id(&updated) {
+        if let Some(id) = vault.matching_id(&updated) {
             updated.id = id.clone();
             candidate.set_account_id(id).await;
         }
     }
+    if let Some(id) = remove {
+        vault.accounts.retain(|config| config.id != id);
+    }
+    vault.upsert(updated.clone())?;
+    vault.save(&state.store)?;
     *state.pending_login.write().await = None;
-    persist(&state.store, &updated)?;
     let result = summary(&updated);
     state.transfers.set_client(Some(candidate.clone())).await;
     *state.client.write().await = Some(candidate);
@@ -153,27 +204,16 @@ async fn get_account(state: State<'_, AppState>) -> Result<Option<AccountSummary
         return Ok(Some(summary(&current.account_config().await)));
     }
     let vault = sessions::Sessions::load(&state.store)?;
-    if let Some(mut config) = vault
-        .accounts
-        .iter()
-        .find(|config| Some(&config.id) == vault.active_id.as_ref())
-        .cloned()
-    {
-        config.migrate_saved_space();
-        return connect_locked(&state, config).await.map(Some);
+    let mut accounts = vault.accounts;
+    accounts.sort_by_key(|config| Some(&config.id) != vault.active_id.as_ref());
+    let mut first_error = None;
+    for config in accounts {
+        match connect_locked(&state, config).await {
+            Ok(account) => return Ok(Some(account)),
+            Err(error) => { first_error.get_or_insert(error); }
+        }
     }
-    Ok(None)
-}
-#[tauri::command]
-async fn disconnect_account(state: State<'_, AppState>) -> Result<(), String> {
-    state.scan_cancel.store(true, Ordering::Release);
-    let _guard = state.session.lock().await;
-    state.transfers.set_client(None).await;
-    *state.client.write().await = None;
-    *state.pending_login.write().await = None;
-    let mut vault = sessions::Sessions::load(&state.store)?;
-    vault.active_id = None;
-    vault.save(&state.store)
+    first_error.map_or(Ok(None), Err)
 }
 #[tauri::command]
 async fn list_accounts(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
@@ -206,29 +246,32 @@ async fn select_account(state: State<'_, AppState>, id: String) -> Result<Accoun
         .accounts
         .into_iter()
         .find(|config| config.id == id)
-        .ok_or("该会话已被移除，请重新登录")?;
+        .ok_or("该账号已删除，请重新登录")?;
     connect_locked(&state, config).await
 }
 #[tauri::command]
-async fn remove_account(state: State<'_, AppState>, id: String) -> Result<(), String> {
+async fn remove_account(state: State<'_, AppState>, id: String) -> Result<Option<AccountSummary>, String> {
     let _guard = state.session.lock().await;
     let mut vault = sessions::Sessions::load(&state.store)?;
-    vault.accounts.retain(|config| config.id != id);
-    let current = match state.client.read().await.as_ref() {
-        Some(client) => Some(client.account_config().await.id),
-        None => None,
-    };
+    if !vault.accounts.iter().any(|config| config.id == id) {
+        return Ok(None);
+    }
+    if vault.accounts.len() == 1 {
+        return Err("请先添加另一个账号，再删除此账号".into());
+    }
     if vault.active_id.as_deref() == Some(&id) {
-        vault.active_id = None;
+        let mut first_error = None;
+        for replacement in vault.accounts.into_iter().filter(|entry| entry.id != id) {
+            match activate_account(&state, replacement, Some(&id)).await {
+                Ok(account) => return Ok(Some(account)),
+                Err(error) => { first_error.get_or_insert(error); }
+            }
+        }
+        return Err(format!("无法切换到其他账号：{}", first_error.unwrap_or_default()));
     }
+    vault.accounts.retain(|config| config.id != id);
     vault.save(&state.store)?;
-    if current.as_deref() == Some(&id) {
-        state.scan_cancel.store(true, Ordering::Release);
-        state.transfers.set_client(None).await;
-        *state.client.write().await = None;
-        *state.pending_login.write().await = None;
-    }
-    Ok(())
+    Ok(None)
 }
 #[tauri::command]
 async fn discover_official() -> Result<official::OfficialDiscovery, String> {
@@ -251,18 +294,87 @@ async fn import_official(state: State<'_, AppState>) -> Result<AccountSummary, S
     connect(&state, config).await
 }
 #[tauri::command]
-async fn switch_space(
+async fn list_browse_sources(state: State<'_, AppState>, account_id: String) -> Result<Vec<BrowseSource>, String> {
+    let _guard = state.session.lock().await;
+    browse_account(&state, &account_id).await?;
+    Ok(sessions::Sessions::load(&state.store)?.sources.into_iter()
+        .filter(|source| source.owner_id == account_id && !source.removed)
+        .map(browse_source_summary)
+        .collect())
+}
+async fn browse_account(state: &AppState, expected_id: &str) -> Result<CloudClient, String> {
+    let account = client(state).await?;
+    if account.account_config().await.id != expected_id {
+        return Err("当前账号已切换，请重试".into());
+    }
+    Ok(account)
+}
+fn browse_source_summary(mut source: BrowseSource) -> BrowseSource {
+    source.reference.clear();
+    source.owner_id.clear();
+    source
+}
+#[tauri::command]
+async fn add_browse_source(
     state: State<'_, AppState>,
-    space: String,
-    cloud_id: String,
-    link_id: String,
-) -> Result<AccountSummary, String> {
-    let mut config = client(&state).await?.account_config().await;
-    config.space = space;
-    config.cloud_id = cloud_id;
-    config.link_id = link_id;
-    config.root_id.clear();
-    connect(&state, config).await
+    account_id: String,
+    kind: String,
+    input: String,
+) -> Result<BrowseSource, String> {
+    let reference = match kind.as_str() {
+        "share" => cloud::normalize_share_input(&input)?,
+        "group" => {
+            let input = input.trim();
+            if input.is_empty() || input.len() > 128 || !input.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+                return Err("请填写有效的群组 ID".into());
+            }
+            input.into()
+        }
+        _ => return Err("未知的浏览来源".into()),
+    };
+    let _guard = state.session.lock().await;
+    let account = browse_account(&state, &account_id).await?;
+    let mut vault = sessions::Sessions::load(&state.store)?;
+    let existing = vault.sources.iter().position(|source| {
+        source.owner_id == account_id && source.kind == kind
+            && source.reference.split('#').next() == reference.split('#').next()
+    });
+    let mut source = BrowseSource {
+        id: existing.map(|i| vault.sources[i].id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        kind,
+        name: String::new(),
+        owner_id: account_id,
+        removed: false,
+        reference,
+    };
+    let source_client = source.client(&account).await?;
+    source.name = if source.kind == "share" {
+        source_client.share_title().await?
+    } else {
+        source_client.list_page(&source_client.root().await, None).await?;
+        format!("群组 {}", source.reference)
+    };
+    if let Some(index) = existing {
+        vault.sources[index] = source.clone();
+    } else {
+        vault.sources.push(source.clone());
+    }
+    vault.save(&state.store)?;
+    Ok(browse_source_summary(source))
+}
+#[tauri::command]
+async fn remove_browse_source(state: State<'_, AppState>, account_id: String, id: String) -> Result<(), String> {
+    let _guard = state.session.lock().await;
+    browse_account(&state, &account_id).await?;
+    let mut vault = sessions::Sessions::load(&state.store)?;
+    if let Some(source) = vault.sources.iter_mut().find(|source| {
+        source.owner_id == account_id && source.id == id && !source.removed
+    }) {
+        // Queued downloads still need the source credentials after its list entry is removed.
+        source.removed = true;
+        vault.save(&state.store)?;
+    }
+    Ok(())
 }
 #[tauri::command]
 async fn update_options(
@@ -272,9 +384,6 @@ async fn update_options(
     let mut updated = client(&state).await?.account_config().await;
     if let Some(value) = config["customUploadPartSize"].as_u64() {
         updated.custom_upload_part_size = value;
-    }
-    if let Some(value) = config["reportRealSize"].as_bool() {
-        updated.report_real_size = value;
     }
     if let Some(value) = config["useLargeThumbnail"].as_bool() {
         updated.use_large_thumbnail = value;
@@ -288,7 +397,7 @@ async fn get_options(state: State<'_, AppState>) -> Result<Value, String> {
         None => AccountConfig::default(),
     };
     Ok(
-        serde_json::json!({"concurrency":state.transfers.concurrency(),"customUploadPartSize":config.custom_upload_part_size,"reportRealSize":config.report_real_size,"useLargeThumbnail":config.use_large_thumbnail}),
+        serde_json::json!({"concurrency":state.transfers.concurrency(),"customUploadPartSize":config.custom_upload_part_size,"useLargeThumbnail":config.use_large_thumbnail}),
     )
 }
 #[tauri::command]
@@ -311,10 +420,10 @@ async fn open_completed_transfer(
             .db
             .lock()
             .map_err(|_| "传输记录不可用".to_string())?;
-        db.query_row("SELECT local_path FROM transfers WHERE id=?1 AND direction='download' AND status='completed'",[id],|row|row.get(0)).optional().map_err(|e|e.to_string())?
+        db.query_row("SELECT COALESCE(shared_download_uri,local_path) FROM transfers WHERE id=?1 AND direction='download' AND status='completed'",[id],|row|row.get(0)).optional().map_err(|e|e.to_string())?
     };
     let path = path.ok_or("仅支持打开已完成的下载")?;
-    if !tokio::fs::try_exists(&path)
+    if !path.starts_with("content://") && !path.starts_with("file://") && !tokio::fs::try_exists(&path)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -375,23 +484,28 @@ async fn list_files(
     parent: CloudFile,
     cursor: Option<String>,
 ) -> Result<FilePage, String> {
-    client(&state).await?.list_page(&parent, cursor).await
+    let current = file_client(&state, &parent).await?;
+    let mut directory = parent;
+    if directory.source_id.is_some() && directory.id.is_empty() {
+        directory.id = current.root().await.id;
+    }
+    let mut page = current.list_page(&directory, cursor).await?;
+    for file in &mut page.files {
+        file.source_id.clone_from(&directory.source_id);
+    }
+    Ok(page)
 }
 #[tauri::command]
 async fn get_link(state: State<'_, AppState>, file: CloudFile) -> Result<String, String> {
-    client(&state).await?.link(&file).await
+    file_client(&state, &file).await?.link(&file).await
 }
 #[tauri::command]
 async fn get_preview(state: State<'_, AppState>, file: CloudFile) -> Result<Value, String> {
-    client(&state).await?.preview(&file).await
+    file_client(&state, &file).await?.preview(&file).await
 }
 #[tauri::command]
 async fn get_quota(state: State<'_, AppState>) -> Result<Quota, String> {
     client(&state).await?.quota().await
-}
-#[tauri::command]
-async fn get_spaces(state: State<'_, AppState>) -> Result<Vec<SpaceInfo>, String> {
-    client(&state).await?.spaces().await
 }
 #[tauri::command]
 async fn make_directory(
@@ -399,6 +513,7 @@ async fn make_directory(
     parent: CloudFile,
     name: String,
 ) -> Result<(), String> {
+    require_writable(&parent)?;
     validate_name(&name)?;
     client(&state).await?.mkdir(&parent, &name).await
 }
@@ -408,6 +523,7 @@ async fn rename_file(
     file: CloudFile,
     name: String,
 ) -> Result<(), String> {
+    require_writable(&file)?;
     validate_name(&name)?;
     client(&state).await?.rename(&file, &name).await
 }
@@ -429,6 +545,7 @@ async fn remove_files(state: State<'_, AppState>, files: Vec<CloudFile>) -> Resu
     if files.len() > 10000 {
         return Err("每批操作最多 10,000 个项目".into());
     }
+    files.iter().try_for_each(require_writable)?;
     let current = client(&state).await?;
     let mut failures = Vec::new();
     let mut removed_ids = Vec::new();
@@ -455,6 +572,8 @@ async fn relocate_files(
     if files.len() > 10000 {
         return Err("每批操作最多 10,000 个项目".into());
     }
+    require_writable(&destination)?;
+    files.iter().try_for_each(require_writable)?;
     let current = client(&state).await?;
     for file in files {
         if file.id == destination.id
@@ -478,6 +597,11 @@ async fn queue_transfers(
     state: State<'_, AppState>,
     specs: Vec<TransferSpec>,
 ) -> Result<Vec<TransferJob>, String> {
+    for spec in &specs {
+        if spec.direction == TransferDirection::Upload {
+            require_writable(&spec.remote)?;
+        }
+    }
     let _session = state.session.lock().await;
     state.transfers.enqueue(specs).await
 }
@@ -487,6 +611,7 @@ async fn queue_uploads(
     state: State<'_, AppState>,
     parent: CloudFile,
 ) -> Result<Vec<TransferJob>, String> {
+    require_writable(&parent)?;
     let _session = state.session.lock().await;
     #[cfg(target_os = "android")]
     {
@@ -539,7 +664,12 @@ async fn queue_downloads(
         .try_lock()
         .map_err(|_| "已有目录扫描正在进行，请完成或取消后再添加".to_string())?;
     state.scan_cancel.store(false, Ordering::Release);
-    let current = client(&state).await?;
+    client(&state).await?;
+    let Some(first) = files.first() else { return Ok(Vec::new()); };
+    if files.iter().any(|file| file.source_id != first.source_id) {
+        return Err("请从同一个来源选择下载项目".into());
+    }
+    let current = file_client(&state, first).await?;
     #[cfg(desktop)]
     let directory = {
         let picker = app.clone();
@@ -586,7 +716,7 @@ async fn enqueue_download_tree(
     let mut total = 0usize;
     let mut scanned = 0usize;
     let mut paths: HashMap<PathBuf, String> = HashMap::new();
-    while let Some((file, path)) = pending.pop_front() {
+    while let Some((mut file, path)) = pending.pop_front() {
         if state.scan_cancel.load(Ordering::Acquire) {
             return Err("扫描已取消；已加入的任务保留在传输列表".into());
         }
@@ -624,6 +754,9 @@ async fn enqueue_download_tree(
             );
         }
         if file.is_dir {
+            if file.source_id.is_some() && file.id.is_empty() {
+                file.id = current.root().await.id;
+            }
             tokio::fs::create_dir_all(&target)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -637,7 +770,10 @@ async fn enqueue_download_tree(
                 if scanned + pending.len() + page.files.len() > 100000 {
                     return Err("目录超过 100,000 项；已加入任务可在传输列表查看".into());
                 }
-                pending.extend(page.files.into_iter().map(|child| (child, target.clone())));
+                pending.extend(page.files.into_iter().map(|mut child| {
+                    child.source_id.clone_from(&file.source_id);
+                    (child, target.clone())
+                }));
                 match page.next_cursor {
                     Some(next) if seen.insert(next.clone()) => cursor = Some(next),
                     Some(_) => return Err("云端目录分页没有前进".into()),
@@ -717,16 +853,22 @@ async fn ensure_upload_folder(
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct UploadScanResult {
-    queued: usize,
-    skipped: usize,
+pub(crate) struct UploadScanResult {
+    pub(crate) queued: usize,
+    pub(crate) skipped: usize,
 }
 #[tauri::command]
 async fn queue_upload_directory(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     parent: CloudFile,
+    paths: Option<Vec<String>>,
 ) -> Result<UploadScanResult, String> {
+    require_writable(&parent)?;
+    #[cfg(not(desktop))]
+    if paths.is_some() {
+        return Err("当前平台不支持本机路径拖拽上传".into());
+    }
     let _session = state.session.lock().await;
     let _scan = state
         .scan
@@ -813,29 +955,64 @@ async fn queue_upload_directory(
     }
     #[cfg(desktop)]
     {
-        let picker = app.clone();
-        let picked = tokio::task::spawn_blocking(move || {
-            picker
-                .dialog()
-                .file()
-                .set_title("选择上传文件夹")
-                .blocking_pick_folder()
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-        let Some(picked) = picked else {
-            return Ok(UploadScanResult {
-                queued: 0,
-                skipped: 0,
-            });
+        let supplied = paths.is_some();
+        let paths = if let Some(paths) = paths {
+            paths
+        } else {
+            let picker = app.clone();
+            let picked = tokio::task::spawn_blocking(move || {
+                picker
+                    .dialog()
+                    .file()
+                    .set_title("选择上传文件夹")
+                    .blocking_pick_folder()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            let Some(picked) = picked else {
+                return Ok(UploadScanResult {
+                    queued: 0,
+                    skipped: 0,
+                });
+            };
+            vec![picked
+                .into_path()
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .into_owned()]
         };
-        let directory = picked.into_path().map_err(|e| e.to_string())?;
-        let name = directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("无法识别文件夹名称")?;
-        let remote = ensure_upload_folder(&current, &parent, name, &mut folder_cache).await?;
-        let mut pending = VecDeque::from([(directory, remote)]);
+        let (roots, ignored) = upload_paths::prepare(paths).await?;
+        skipped += ignored;
+        let mut pending = VecDeque::new();
+        for root in roots {
+            scanned += 1;
+            if state.scan_cancel.load(Ordering::Acquire) {
+                return Err("扫描已取消；已加入任务保留在传输列表".into());
+            }
+            if root.is_directory {
+                let remote =
+                    ensure_upload_folder(&current, &parent, &root.name, &mut folder_cache).await?;
+                pending.push_back((root.path, remote));
+            } else if supplied {
+                batch.push(TransferSpec {
+                    direction: TransferDirection::Upload,
+                    remote: parent.clone(),
+                    local_path: root.path.to_string_lossy().into_owned(),
+                    name: Some(root.name),
+                });
+                if batch.len() >= 100 {
+                    queued += state
+                        .transfers
+                        .enqueue(std::mem::take(&mut batch))
+                        .await?
+                        .len();
+                    let _ = app.emit(
+                        "scan-progress",
+                        serde_json::json!({"queued":queued,"path":parent.name}),
+                    );
+                }
+            }
+        }
         while let Some((local, remote)) = pending.pop_front() {
             let mut entries = tokio::fs::read_dir(&local)
                 .await
@@ -889,19 +1066,61 @@ async fn queue_upload_directory(
     Ok(UploadScanResult { queued, skipped })
 }
 #[tauri::command]
-fn transfer_summary(state: State<'_, AppState>) -> Result<Value, String> {
-    state.store.summary()
+async fn request_transfer_protection(
+    app: tauri::AppHandle,
+) -> Result<tauri_plugin_document_picker::ForegroundStatus, String> {
+    app.document_picker().request_transfer_protection().await
 }
 #[tauri::command]
-fn list_transfers(
+async fn transfer_overview(
+    state: State<'_, AppState>,
+) -> Result<transfer_activity::TransferOverview, String> {
+    state.transfers.overview().await
+}
+#[tauri::command]
+async fn transfer_summary(state: State<'_, AppState>) -> Result<Value, String> {
+    let store = state.store.clone();
+    tauri::async_runtime::spawn_blocking(move || store.summary())
+        .await
+        .map_err(|error| error.to_string())?
+}
+#[tauri::command]
+async fn list_transfers(
     state: State<'_, AppState>,
     limit: usize,
     offset: usize,
     filter: Option<String>,
 ) -> Result<Vec<TransferJob>, String> {
-    state
-        .transfers
-        .list_filtered(limit, offset, filter.as_deref().unwrap_or("all"))
+    let transfers = state.transfers.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        transfers.list_filtered(limit, offset, filter.as_deref().unwrap_or("all"))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+#[tauri::command]
+async fn frontend_ready(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        if state.tray_ready.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            tray::setup(&app).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        if result.is_err() {
+            state.tray_ready.store(false, Ordering::Release);
+        }
+        result
+    }
+    #[cfg(mobile)]
+    {
+        let _ = (app, state);
+        Ok(())
+    }
 }
 #[tauri::command]
 fn control_transfer(state: State<'_, AppState>, id: String, action: String) -> Result<(), String> {
@@ -914,8 +1133,31 @@ fn control_transfer(state: State<'_, AppState>, id: String, action: String) -> R
     }
 }
 #[tauri::command]
+async fn control_transfers(
+    state: State<'_, AppState>,
+    action: String,
+    direction: Option<String>,
+) -> Result<usize, String> {
+    if action == "resume" {
+        let _session = state.session.lock().await;
+        state
+            .transfers
+            .control_batch(&action, direction.as_deref())
+            .await
+    } else {
+        state
+            .transfers
+            .control_batch(&action, direction.as_deref())
+            .await
+    }
+}
+#[tauri::command]
 fn clear_finished(state: State<'_, AppState>) -> Result<usize, String> {
     state.transfers.remove_finished()
+}
+#[tauri::command]
+fn remove_completed_transfer(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.transfers.remove_completed(&id)
 }
 #[tauri::command]
 fn set_concurrency(state: State<'_, AppState>, concurrency: usize) -> Result<(), String> {
@@ -923,17 +1165,48 @@ fn set_concurrency(state: State<'_, AppState>, concurrency: usize) -> Result<(),
     state.transfers.set_concurrency(concurrency)
 }
 
+#[tauri::command]
+async fn set_video_immersive(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    app.document_picker().set_video_immersive(enabled).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Acquire the instance lock before opening the transfer database or webview.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        tray::show(app);
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_document_picker::init())
+        .on_window_event(|window, event| {
+            #[cfg(desktop)]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.app_handle().tray_by_id("main").is_some() && window.hide().is_ok() {
+                    api.prevent_close();
+                }
+            }
+            #[cfg(mobile)]
+            let _ = (window, event);
+        })
         .setup(|app| {
             let store =
                 Arc::new(Store::new(&app.path().app_data_dir()?).map_err(std::io::Error::other)?);
+            app.manage(file_preview::ArchivePreviews::default());
+            app.manage(Arc::new(openlist_crypt::CryptManager::default()));
+            app.manage(Arc::new(
+                repositories::RepositoryManager::new(
+                    app.path().app_data_dir()?.join("AxuanStor"),
+                    app.path().app_cache_dir()?.join("AxuanStor"),
+                )
+                .map_err(std::io::Error::other)?,
+            ));
             let transfers = TransferManager::new(store.clone(), app.handle().clone());
+            transfers.discard_previews_on_start(&app.path().app_cache_dir()?.join("AxuanStor/repository-previews")).map_err(std::io::Error::other)?;
             transfers
                 .set_concurrency(store.concurrency().map_err(std::io::Error::other)?)
                 .map_err(std::io::Error::other)?;
@@ -943,7 +1216,9 @@ pub fn run() {
                 pending_login: RwLock::new(None),
                 session: Mutex::new(()),
                 scan: Mutex::new(()),
-                scan_cancel: AtomicBool::new(false),
+                scan_cancel: Arc::new(AtomicBool::new(false)),
+                #[cfg(desktop)]
+                tray_ready: AtomicBool::new(false),
                 store,
                 transfers,
             });
@@ -963,25 +1238,35 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            frontend_ready,
             connect_account,
             list_accounts,
             select_account,
             remove_account,
             get_account,
-            disconnect_account,
             discover_official,
             import_official,
-            switch_space,
+            list_browse_sources,
+            add_browse_source,
+            remove_browse_source,
             update_options,
             get_options,
             get_foreground_status,
+            request_transfer_protection,
             open_completed_transfer,
             export_completed_transfer,
             list_files,
             get_link,
             get_preview,
+            set_video_immersive,
+            file_preview::read_text_preview,
+            file_preview::read_pdf_preview,
+            file_preview::read_office_preview,
+            file_preview::open_archive_preview,
+            file_preview::close_archive_preview,
+            file_preview::save_archive_member,
+            file_preview::save_archive_selection,
             get_quota,
-            get_spaces,
             make_directory,
             rename_file,
             remove_files,
@@ -992,10 +1277,55 @@ pub fn run() {
             queue_downloads,
             list_transfers,
             transfer_summary,
+            transfer_overview,
             control_transfer,
+            control_transfers,
             clear_finished,
+            remove_completed_transfer,
             set_concurrency,
-            cancel_scan
+            cancel_scan,
+            repositories::probe_repositories,
+            repositories::open_repository,
+            repositories::list_repository,
+            repositories::close_repository,
+            repositories::forget_repository_unlock,
+            repositories::edit_repository,
+            repositories::plan_repository_uploads,
+            repositories::execute_repository_uploads,
+            repositories::create_repository,
+            repositories::create_named_repository,
+            repositories::change_repository_unlock,
+            repositories::generate_repository_key,
+            repositories::download_repository_file,
+            repositories::export_repository_download,
+            repositories::import_repository_key
+            ,repositories::cache::label_repository_cache
+            ,repositories::cache::list_repository_caches
+            ,repositories::cache::delete_repository_cache
+            ,repositories::cache::forget_all_repository_credentials
+            ,repositories::queue::queue_repository_downloads
+            ,repositories::repository_file_link
+            ,repositories::bridge::import_cloud_to_repository
+            ,repositories::bridge::export_repository_to_cloud
+            ,repositories::bridge::relocate_between_repositories
+            ,repositories::preview::preview_repository_file
+            ,repositories::preview::repository_preview_ready
+            ,repositories::preview::release_repository_preview
+            ,repositories::preview::open_repository_media_player
+            ,openlist_crypt::probe_crypt_folders
+            ,openlist_crypt::create_crypt_folder
+            ,openlist_crypt::open_crypt_folder
+            ,openlist_crypt::close_crypt_folder
+            ,openlist_crypt::list_crypt_folder
+            ,openlist_crypt::edit_crypt_folder
+            ,openlist_crypt::batch_edit_crypt_folder
+            ,openlist_crypt::update_crypt_folder_settings
+            ,openlist_crypt::queue_crypt_uploads
+            ,openlist_crypt::queue_crypt_upload_directory
+            ,openlist_crypt::queue_crypt_downloads
+            ,openlist_crypt::preview_crypt_file
+            ,openlist_crypt::release_crypt_preview
+            ,openlist_crypt::open_crypt_media_player
         ])
         .run(tauri::generate_context!())
         .expect("CMCloud++ failed to start");

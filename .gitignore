@@ -11,6 +11,7 @@ coverage/
 *.tsbuildinfo
 .build-tmp/
 releases/
+AGENTS.md
 .env
 .env.*
 !.env.example

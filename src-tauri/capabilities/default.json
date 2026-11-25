@@ -2,14 +2,16 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
   "description": "Local cloud client window",
-  "windows": [
-    "main"
-  ],
+  "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:allow-open",
     "dialog:allow-save",
-    "opener:allow-open-url",
-    "core:window:allow-set-theme"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+    },
+    "core:window:allow-set-theme",
+    "core:window:allow-set-title"
   ]
 }

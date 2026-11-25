@@ -16,7 +16,10 @@ release = project / "releases"
 assets = re.findall(r"assets/([^\"']+)", (project / "dist/index.html").read_text(encoding="utf-8"))
 if len(assets) < 2:
     raise RuntimeError("Production HTML lacks expected assets")
-windows = (release / f"CMCloudPlusPlus-{version}-windows-x64.exe").read_bytes()
+windows_path = release / f"CMCloudPlusPlus-{version}-windows-x64-portable.exe"
+if not windows_path.is_file():
+    windows_path = release / f"CMCloudPlusPlus-{version}-windows-x64.exe"
+windows = windows_path.read_bytes()
 apk_path = release / f"CMCloudPlusPlus-{version}-android-arm64-preview.apk"
 with zipfile.ZipFile(apk_path) as apk:
     architectures = {name.split("/")[1] for name in apk.namelist() if name.startswith("lib/") and name.endswith(".so")}
@@ -61,7 +64,8 @@ with zipfile.ZipFile(apk_path) as apk:
                             check=True, capture_output=True, text=True, encoding="utf-8").stdout
     if "scaleX" not in vector or "translateX" not in vector or "E: vector" not in vector:
         raise RuntimeError("APK launcher foreground lacks its safe-area transform")
-source = (project / "src-tauri/target/aarch64-linux-android/release/libcmcloud_lib.so").read_bytes()
+target_directory = Path(os.environ.get("CARGO_TARGET_DIR", project / "src-tauri/target"))
+source = (target_directory / "aarch64-linux-android/release/libcmcloud_lib.so").read_bytes()
 if hashlib.sha256(library).digest() != hashlib.sha256(source).digest():
     raise RuntimeError("APK native library differs from Cargo output")
 for target, binary in [("Windows", windows), ("Android", library)]:

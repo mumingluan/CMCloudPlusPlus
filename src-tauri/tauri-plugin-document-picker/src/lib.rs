@@ -46,6 +46,8 @@ pub struct ForegroundStatus {
     pub supported: bool,
     pub active: bool,
     pub notification_permission: bool,
+    #[serde(default)]
+    pub user_stopped: bool,
     pub reason: Option<String>,
 }
 
@@ -78,26 +80,150 @@ impl<R: Runtime, T: Manager<R>> DocumentPickerExt<R> for T {
 }
 
 impl<R: Runtime> DocumentPicker<R> {
+    #[cfg(target_os = "android")]
+    pub async fn open_media_stream(&self, url: &str, mime: &str) -> Result<(), String> {
+        self.call::<serde_json::Value>("openMediaStream", serde_json::json!({ "url": url, "mime": mime }))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn set_video_immersive(&self, enabled: bool) -> Result<(), String> {
+        #[cfg(target_os = "android")]
+        {
+            self.call::<serde_json::Value>(
+                "setVideoImmersive",
+                serde_json::json!({ "enabled": enabled }),
+            )
+            .await
+            .map(|_| ())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = enabled;
+            Ok(())
+        }
+    }
+
+    /// Protect opaque AxuanStor unlock/token bytes with Android Keystore.
+    /// Input/output use base64 only across this native bridge, never logging it.
+    pub async fn seal_secret(&self, id: &str, data: &str) -> Result<String, String> {
+        self.system_secret("sealSecret",id,data).await
+    }
+    pub async fn unseal_secret(&self, id: &str, data: &str) -> Result<String, String> {
+        self.system_secret("unsealSecret",id,data).await
+    }
+    pub async fn clear_secrets(&self)->Result<(),String>{
+        #[cfg(target_os="android")]
+        {self.call::<serde_json::Value>("clearSecrets",serde_json::json!({})).await.map(|_|())}
+        #[cfg(not(target_os="android"))]
+        {Err("此安全存储桥接仅用于 Android".into())}
+    }
+    async fn system_secret(&self, command: &'static str, id: &str, data: &str) -> Result<String,String> {
+        #[cfg(target_os="android")]
+        {
+            let value:serde_json::Value=self.call(command,serde_json::json!({"id":id,"data":data})).await?;
+            value["data"].as_str().map(str::to_owned).ok_or_else(||"系统安全存储返回无效数据".into())
+        }
+        #[cfg(not(target_os="android"))]
+        {let _=(command,id,data);Err("此安全存储桥接仅用于 Android".into())}
+    }
     /// Open an app-owned finished download using a narrowly scoped FileProvider.
     pub async fn open_download(&self, path: &str) -> Result<(), String> {
         #[cfg(target_os = "android")]
-        { self.call::<serde_json::Value>("openDownload", serde_json::json!({"path":path})).await.map(|_| ()) }
+        {
+            self.call::<serde_json::Value>("openDownload", serde_json::json!({"path":path}))
+                .await
+                .map(|_| ())
+        }
         #[cfg(not(target_os = "android"))]
-        { let _=path; Err("此文档打开接口仅支持 Android".into()) }
+        {
+            let _ = path;
+            Err("此文档打开接口仅支持 Android".into())
+        }
     }
+    #[cfg(target_os = "android")]
+    pub async fn ensure_shared_downloads(&self) -> Result<(), String> {
+        self.call::<serde_json::Value>("ensureSharedDownloads", serde_json::json!({}))
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "android")]
+    pub async fn prepare_shared_download(
+        &self, path: &str, folder: &str, uri: Option<&str>,
+    ) -> Result<String, String> {
+        let result: serde_json::Value = self.call("prepareSharedDownload",
+            serde_json::json!({ "path": path, "folder": folder, "uri": uri })).await?;
+        result["uri"].as_str().map(str::to_owned).ok_or_else(|| "公共下载记录无效".into())
+    }
+
+    #[cfg(target_os = "android")]
+    pub async fn finish_shared_download(&self, path: &str, uri: &str) -> Result<(), String> {
+        self.call::<serde_json::Value>("finishSharedDownload", serde_json::json!({ "path": path, "uri": uri }))
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "android")]
+    pub async fn discard_shared_download(&self, uri: &str) -> Result<(), String> {
+        self.call::<serde_json::Value>("discardSharedDownload", serde_json::json!({ "uri": uri }))
+            .await
+            .map(|_| ())
+    }
+
+    #[cfg(target_os = "android")]
+    pub async fn save_shared_download(&self, path: &str) -> Result<bool, String> {
+        self.ensure_shared_downloads().await?;
+        let uri = self.prepare_shared_download(path, "", None).await?;
+        if let Err(error) = self.finish_shared_download(path, &uri).await {
+            let _ = self.discard_shared_download(&uri).await;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     /// Export bytes through the user's chosen document provider in bounded chunks.
     pub async fn export_download(&self, path: &str) -> Result<bool, String> {
         #[cfg(target_os = "android")]
-        { let result:serde_json::Value=self.call("exportDownload", serde_json::json!({"path":path})).await?; Ok(result["saved"].as_bool().unwrap_or(false)) }
+        {
+            let result: serde_json::Value = self
+                .call("exportDownload", serde_json::json!({"path":path}))
+                .await?;
+            Ok(result["saved"].as_bool().unwrap_or(false))
+        }
         #[cfg(not(target_os = "android"))]
-        { let _=path; Err("此导出接口仅支持 Android".into()) }
+        {
+            let _ = path;
+            Err("此导出接口仅支持 Android".into())
+        }
     }
     /// Start or refresh a two-minute foreground transfer lease. Start from a
     /// user-initiated queue action, then refresh every 30–60 seconds while busy.
     pub async fn begin_transfers(&self) -> Result<ForegroundStatus, String> {
+        self.begin_transfers_with_status(serde_json::json!({}))
+            .await
+    }
+
+    pub async fn begin_transfers_with_status(
+        &self,
+        status: serde_json::Value,
+    ) -> Result<ForegroundStatus, String> {
         #[cfg(target_os = "android")]
         {
-            self.call("beginTransfers", serde_json::json!({})).await
+            self.call("beginTransfers", status).await
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = status;
+            self.foreground_status().await
+        }
+    }
+
+    pub async fn request_transfer_protection(&self) -> Result<ForegroundStatus, String> {
+        #[cfg(target_os = "android")]
+        {
+            self.call("requestTransferProtection", serde_json::json!({}))
+                .await
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -129,6 +255,7 @@ impl<R: Runtime> DocumentPicker<R> {
                 supported: false,
                 active: false,
                 notification_permission: false,
+                user_stopped: false,
                 reason: None,
             })
         }

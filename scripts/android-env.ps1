@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
-$cmProjectRoot = Split-Path -Parent $PSScriptRoot
-$cmBuildTemp = Join-Path $cmProjectRoot '.build-tmp'
+$cmBuildTemp = if ($env:CMCLOUD_BUILD_TEMP) { $env:CMCLOUD_BUILD_TEMP } else {
+    Join-Path (Split-Path -Parent $PSScriptRoot) '.build-tmp'
+}
 New-Item -ItemType Directory -Force -Path $cmBuildTemp | Out-Null
 
 # The JVM selector's local wakeup pipe can fail in the inherited Windows TEMP
@@ -33,6 +34,10 @@ foreach ($cmTarget in @('AARCH64', 'X86_64')) {
     $cmExistingRustFlags = [Environment]::GetEnvironmentVariable($cmRustFlagsName, 'Process')
     if ($cmExistingRustFlags -notmatch 'max-page-size') {
         [Environment]::SetEnvironmentVariable($cmRustFlagsName, ($cmExistingRustFlags + ' -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384').Trim(), 'Process')
+    }
+    if ($cmTarget -eq 'AARCH64') {
+        $cmArmFlags = [Environment]::GetEnvironmentVariable($cmRustFlagsName, 'Process')
+        if ($cmArmFlags -notmatch 'aes_armv8') { [Environment]::SetEnvironmentVariable($cmRustFlagsName, ($cmArmFlags + ' --cfg aes_armv8').Trim(), 'Process') }
     }
 }
 

@@ -1,17 +1,27 @@
 import type { CloudFile } from './types';
+import mediaFormats from './mediaFormats.json';
+export const vendorFolders = new Set(['手机图片', '同步盘', '我的应用收藏', 'AI空间']);
+export function isVendorFolder(file: CloudFile, atRoot: boolean) {
+  return atRoot && file.isDir && vendorFolders.has(file.name);
+}
 export function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
   const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / 1024 ** power).toLocaleString('zh-CN', { maximumFractionDigits: power > 1 ? 2 : 0 })} ${units[power]}`;
 }
+export function mediaMime(name: string) {
+  const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
+  return Object.hasOwn(mediaFormats, ext) ? mediaFormats[ext as keyof typeof mediaFormats] : undefined;
+}
 export function fileKind(file: CloudFile): string {
   if (file.isDir) return '文件夹';
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
   if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'bmp'].includes(ext)) return '图片';
-  if (['mp4', 'mov', 'mkv', 'avi', 'webm'].includes(ext)) return '视频';
-  if (['mp3', 'wav', 'flac', 'm4a', 'aac'].includes(ext)) return '音频';
-  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return '压缩包';
+  const media = mediaMime(file.name);
+  if (media?.startsWith('video/')) return '视频';
+  if (media?.startsWith('audio/')) return '音频';
+  if (['zip', 'rar', '7z', 'tar', 'gz', 'tgz'].includes(ext)) return '压缩包';
   return ext.toUpperCase() || '文件';
 }
 export function sortFiles(files: CloudFile[], key: string, desc: boolean): CloudFile[] {
@@ -29,6 +39,63 @@ export function sortFiles(files: CloudFile[], key: string, desc: boolean): Cloud
 }
 export function validName(name: string): boolean {
   return !!name.trim() && !/[\x00-\x1f/\\]/.test(name) && !['.', '..'].includes(name.trim());
+}
+export function formatCloudPath(segments: Pick<CloudFile, 'name'>[]): string {
+  const names = segments.map((item) => item.name).filter(Boolean);
+  return '/' + names.join('/');
+}
+export function formatRepositoryPath(cloudPath: string, innerPath: string): string {
+  const base = cloudPath.startsWith('/') ? cloudPath : `/${cloudPath}`;
+  return `${base}:${innerPath}`;
+}
+export function normalizePathSegments(parts: string[]): string[] {
+  const out: string[] = [];
+  for (const raw of parts) {
+    const part = raw.trim();
+    if (!part || part === '.') continue;
+    if (part === '..') out.pop();
+    else out.push(part);
+  }
+  return out;
+}
+export type ParsedAddressPath =
+  | { kind: 'cloud'; segments: string[] }
+  | { kind: 'repository'; cloudSegments: string[]; innerPath: string };
+export function parseAddressPath(
+  raw: string,
+  context?: {
+    cloudSegments?: string[];
+    repository?: { cloudSegments: string[]; innerPath: string };
+  },
+): ParsedAddressPath {
+  const trimmed = raw.trim().replace(/\\+/g, '/');
+  if (!trimmed || trimmed === '/') return { kind: 'cloud', segments: [] };
+  const colon = trimmed.indexOf(':');
+  if (colon >= 0) {
+    const cloudPart = trimmed.slice(0, colon).trim();
+    const innerPart = trimmed.slice(colon + 1).trim();
+    const cloudSegments = cloudPart
+      ? normalizePathSegments([
+          ...(cloudPart.startsWith('/') ? [] : (context?.cloudSegments ?? [])),
+          ...cloudPart.split('/'),
+        ])
+      : (context?.repository?.cloudSegments ?? []);
+    const innerPath = normalizePathSegments(innerPart.split('/')).join('/');
+    return { kind: 'repository', cloudSegments, innerPath };
+  }
+  if (!trimmed.startsWith('/') && context?.repository) {
+    const base = context.repository.innerPath ? context.repository.innerPath.split('/') : [];
+    return {
+      kind: 'repository',
+      cloudSegments: context.repository.cloudSegments,
+      innerPath: normalizePathSegments([...base, ...trimmed.split('/')]).join('/'),
+    };
+  }
+  const base = trimmed.startsWith('/') ? [] : (context?.cloudSegments ?? []);
+  return {
+    kind: 'cloud',
+    segments: normalizePathSegments([...base, ...trimmed.split('/')]),
+  };
 }
 export function previewSources(value: unknown): { url: string; label: string }[] {
   const result: { url: string; label: string }[] = [];

@@ -1,0 +1,12 @@
+/* OLED uses the dark theme's colors with pure black working surfaces. */
+:root[data-color-scheme='oled'] {
+  --canvas: #000000;
+  --surface: #000000;
+  --bg-fff: #000000;
+  --bg-f3f5f9: #000000;
+  --bg-f3f5fa: #000000;
+  --bg-f5f7fb: #000000;
+  --bg-f7f9fc: #000000;
+  --bg-f8f9fc: #000000;
+  --bg-fafbfe: #000000;
+}

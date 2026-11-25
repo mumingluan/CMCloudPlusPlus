@@ -7,6 +7,12 @@ export interface CloudFile {
   size: number;
   modifiedAt: string;
   thumbnail?: string | null;
+  sourceId?: string;
+}
+export interface BrowseSource {
+  id: string;
+  kind: 'group' | 'share';
+  name: string;
 }
 export interface FilePage {
   files: CloudFile[];
@@ -16,6 +22,7 @@ export interface AccountSummary {
   id: string;
   name: string;
   account: string;
+  phone?: string;
   space: Space;
   rootId: string;
   cloudId: string;
@@ -36,7 +43,6 @@ export interface LoginConfig {
   userDomainId: string;
   linkId: string;
   customUploadPartSize: number;
-  reportRealSize: boolean;
   useLargeThumbnail: boolean;
 }
 export interface TransferJob {
@@ -60,7 +66,6 @@ export interface Settings {
   concurrency: number;
   uploadPartSize: number;
   largeThumbnail: boolean;
-  reportRealSize: boolean;
   oldStreamUpload: boolean;
 }
 export const spaceNames: Record<Space, string> = {
@@ -82,6 +87,5 @@ export const initialConfig: LoginConfig = {
   userDomainId: '',
   linkId: '',
   customUploadPartSize: 0,
-  reportRealSize: true,
   useLargeThumbnail: false,
 };

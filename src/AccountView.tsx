@@ -1,60 +1,41 @@
-import { useEffect, useRef, useState } from 'react';
-import {
-  Cloud,
-  HardDrive,
-  Info,
-  Loader2,
-  LogOut,
-  UserRound,
-  Trash2,
-  Check,
-} from 'lucide-react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { Cloud, HardDrive, Info, Loader2, Plus, UserRound, Trash2, Check, X } from 'lucide-react';
 import { api, errorText, mobile, native } from './api';
-import { initialConfig, spaceNames } from './types';
-import type { AccountSummary, LoginConfig, Space } from './types';
+import { initialConfig } from './types';
+import { RepositoryDialog } from './RepositoryDialog';
+import type { AccountSummary, LoginConfig } from './types';
 import { formatBytes } from './utils';
 
-type Method = 'official' | 'password' | 'authorization' | 'cookies' | 'share';
+type Method = 'official' | 'password' | 'authorization' | 'cookies';
 type Props = {
+  embedded?: boolean;
   account: AccountSummary | null;
   quota: { used: number; total: number } | null;
   onConnected: (account: AccountSummary) => void;
-  onLogout: () => Promise<void> | void;
   alert: (message: string, error?: boolean) => void;
-  onRemovedCurrent?: () => void;
 };
 
 export function AccountView({
   account,
   quota,
   onConnected,
-  onLogout,
   alert,
-  onRemovedCurrent,
+  embedded = false,
 }: Props) {
   const [method, setMethod] = useState<Method>(mobile ? 'password' : 'official');
   const [config, setConfig] = useState<LoginConfig>({ ...initialConfig });
-  const [space, setSpace] = useState<Space>(account?.space ?? 'personal_new');
-  const [cloudId, setCloudId] = useState(account?.cloudId ?? '');
-  const [linkId, setLinkId] = useState('');
-  const [loginOpen, setLoginOpen] = useState(!account);
-  const [busy, setBusy] = useState<'login' | 'space' | 'logout' | 'session' | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const titleId = useId();
+  const smsTitleId = useId();
+  const [busy, setBusy] = useState<'login' | 'session' | null>(null);
   const [accounts, setAccounts] = useState<AccountSummary[]>(account ? [account] : []);
   const [removing, setRemoving] = useState<string | null>(null);
   const [sessionError, setSessionError] = useState('');
   const [loginError, setLoginError] = useState('');
-  const [spaceError, setSpaceError] = useState('');
   const [smsRequired, setSmsRequired] = useState(false);
   const [discovery, setDiscovery] = useState<Record<string, unknown> | null>(null);
   const submitting = useRef(false);
-
-  useEffect(() => {
-    setSpace(account?.space ?? 'personal_new');
-    setCloudId(account?.cloudId ?? '');
-    setLinkId('');
-    setSpaceError('');
-    setLoginOpen(!account);
-  }, [account?.id, account?.space, account?.cloudId]);
+  const addAccountButton = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!native) {
@@ -82,14 +63,14 @@ export function AccountView({
     setSessionError('');
     try {
       if (remove) {
-        await api.removeAccount(id);
-        if (account?.id === id) onRemovedCurrent?.();
+        const active = await api.removeAccount(id);
+        if (active) onConnected(active);
         setRemoving(null);
-        alert('已移除保存的会话');
+        alert('已删除账号');
       } else {
         onConnected(await api.selectAccount(id));
         setConfig({ ...initialConfig });
-        alert('已切换账号；原账号未完成的传输已暂停');
+        alert('已切换账号');
       }
       setAccounts(await api.accounts());
     } catch (error) {
@@ -118,7 +99,7 @@ export function AccountView({
     setConfig((previous) => ({ ...previous, [key]: value }));
     setLoginError('');
   };
-  const submitLogin = async () => {
+  const submitLogin = async (smsCode = '') => {
     if (submitting.current || !native) return;
     submitting.current = true;
     setBusy('login');
@@ -132,11 +113,8 @@ export function AccountView({
               authorization: method === 'authorization' ? config.authorization.trim() : '',
               username: method === 'password' ? config.username.trim() : '',
               password: method === 'password' ? config.password : '',
-              smsCode: method === 'password' ? config.smsCode.trim() : '',
+              smsCode: method === 'password' ? smsCode : '',
               mailCookies: method === 'password' || method === 'cookies' ? config.mailCookies : '',
-              space: method === 'share' ? 'share' : config.space,
-              cloudId: method !== 'share' && config.space === 'group' ? config.cloudId.trim() : '',
-              linkId: method === 'share' ? config.linkId.trim() : '',
             });
       setConfig({ ...initialConfig });
       setSmsRequired(false);
@@ -145,84 +123,51 @@ export function AccountView({
       alert('云盘已连接');
     } catch (error) {
       const text = errorText(error);
-      if (text.startsWith('SMS_REQUIRED')) {
+      if (method === 'password' && text.startsWith('SMS_REQUIRED')) {
         setSmsRequired(true);
-        setLoginError('需要短信验证。填写收到的验证码后，再次登录。');
+        field('smsCode', '');
       } else setLoginError(text);
     } finally {
       submitting.current = false;
       setBusy(null);
     }
   };
-  const submitSpace = async () => {
-    if (submitting.current || !native || !account) return;
-    if (space === 'group' && !cloudId.trim()) {
-      setSpaceError('请填写要连接的群组 ID。');
-      return;
-    }
-    if (space === 'share' && !linkId.trim()) {
-      setSpaceError('请填写分享链接或分享 ID。');
-      return;
-    }
-    submitting.current = true;
-    setBusy('space');
-    setSpaceError('');
-    try {
-      const result = await api.switchSpace(
-        space,
-        space === 'group' ? cloudId.trim() : '',
-        space === 'share' ? linkId.trim() : '',
-      );
-      onConnected(result);
-      alert(`已连接${spaceNames[result.space]}`);
-    } catch (error) {
-      setSpaceError(errorText(error));
-    } finally {
-      submitting.current = false;
-      setBusy(null);
-    }
-  };
-
-  const logout = async () => {
+  const closeLogin = () => {
     if (submitting.current) return;
-    submitting.current = true;
-    setBusy('logout');
-    try {
-      await onLogout();
-    } catch (error) {
-      setSpaceError(errorText(error));
-    } finally {
-      submitting.current = false;
-      setBusy(null);
-    }
+    setLoginOpen(false);
+    setConfig({ ...initialConfig });
+    setSmsRequired(false);
+    setLoginError('');
+  };
+  const cancelVerification = () => {
+    if (submitting.current) return;
+    setSmsRequired(false);
+    field('smsCode', '');
   };
 
   return (
-    <section className="workspace account-workspace">
-      <div className="page-heading">
-        <h1>会话管理</h1>
-      </div>
+    <section
+      className={embedded ? 'account-section' : 'workspace account-workspace'}
+      aria-label="账号管理"
+    >
       <div className="account-content">
-        <section className="saved-sessions" aria-label="已保存账号">
-          <div className="session-heading">
-            <h2>已保存账号</h2>
-            <span className="muted">{accounts.length} 个</span>
-          </div>
+        <div className="session-heading">
+          <h2 className="session-section-title">账号管理</h2>
+          <span className="muted">{accounts.length} 个</span>
+        </div>
+        <section className="saved-sessions" aria-label="账号列表">
           {accounts.map((entry) => (
             <div className="session-row" key={entry.id}>
               <UserRound size={20} />
               <div className="session-label">
-                <strong>{entry.name}</strong>
-                <small>
-                  {entry.account}
-                  {entry.id === account?.id && (
-                    <span className="account-space-tag">{spaceNames[account.space]}</span>
-                  )}
-                </small>
+                <strong>{entry.phone || entry.account}</strong>
+                {entry.id === account?.id && quota && quota.total > 0 && (
+                  <small>已用 {formatBytes(quota.used)} / {formatBytes(quota.total)}</small>
+                )}
               </div>
               {removing === entry.id ? (
                 <div className="session-confirm">
-                  <span>移除本机凭据？</span>
+                  <span>删除此账号？</span>
                   <button
                     className="button quiet"
                     disabled={!!busy}
@@ -235,41 +180,30 @@ export function AccountView({
                     disabled={!!busy}
                     onClick={() => void manageSession(entry.id, true)}
                   >
-                    确认移除
+                    确认删除
                   </button>
                 </div>
               ) : (
                 <div className="session-actions">
                   {entry.id === account?.id ? (
-                    <>
-                      <span className="session-current">
-                        <Check size={14} />
-                        当前
-                      </span>
-                      <button
-                        className="icon-button"
-                        title="断开连接"
-                        aria-label="断开当前会话"
-                        disabled={!!busy || !native}
-                        onClick={() => void logout()}
-                      >
-                        <LogOut size={16} />
-                      </button>
-                    </>
+                    <span className="session-current">
+                      <Check size={14} />
+                      当前
+                    </span>
                   ) : (
                     <button
                       className="button secondary"
                       disabled={!!busy || !native}
                       onClick={() => void manageSession(entry.id, false)}
                     >
-                      连接
+                      切换
                     </button>
                   )}
                   <button
                     className="icon-button danger"
-                    aria-label={`移除 ${entry.name}`}
-                    title="移除本机凭据"
-                    disabled={!!busy || !native}
+                    aria-label={`删除 ${entry.phone || entry.account}`}
+                    title={accounts.length === 1 ? "请先添加另一个账号" : "删除账号"}
+                    disabled={!!busy || !native || accounts.length < 2}
                     onClick={() => setRemoving(entry.id)}
                   >
                     <Trash2 size={16} />
@@ -278,135 +212,36 @@ export function AccountView({
               )}
             </div>
           ))}
-          {!accounts.length && <p className="muted">登录后会安全保存会话，下次可直接连接。</p>}
+          {!accounts.length && <p className="muted">尚未添加账号</p>}
           {sessionError && (
             <p className="inline-error" role="alert">
               {sessionError}
             </p>
           )}
         </section>
-        {account && (
-          <>
-            {quota && quota.total > 0 && (
-              <div className="account-quota">
-                <span>
-                  已用 {formatBytes(quota.used)} / {formatBytes(quota.total)}
-                </span>
-                <progress aria-label="云盘容量使用情况" max={quota.total} value={quota.used} />
-              </div>
-            )}
-            <form
-              className="account-space-form"
-              aria-label="切换云空间"
-              onSubmit={(e) => {
-                e.preventDefault();
-                void submitSpace();
-              }}
-            >
-              <h2>切换云空间</h2>
-              <fieldset disabled={!!busy}>
-                <div className="space-form-fields">
-                  <label className="form-field">
-                    目标空间
-                    <select
-                      value={space}
-                      onChange={(e) => {
-                        setSpace(e.target.value as Space);
-                        setSpaceError('');
-                      }}
-                    >
-                      {Object.entries(spaceNames).map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  {space === 'group' && (
-                    <label className="form-field">
-                      群组 ID
-                      <input
-                        required
-                        value={cloudId}
-                        onChange={(e) => {
-                          setCloudId(e.target.value);
-                          setSpaceError('');
-                        }}
-                        placeholder="输入要访问的群组 ID"
-                      />
-                    </label>
-                  )}
-                </div>
-                {space === 'share' && (
-                  <label className="form-field">
-                    分享链接
-                    <textarea
-                      required
-                      value={linkId}
-                      onChange={(e) => {
-                        setLinkId(e.target.value);
-                        setSpaceError('');
-                      }}
-                      rows={3}
-                      placeholder={'分享链接或 link_id，带提取码：link_id#提取码\n多个分享每行一个'}
-                    />
-                    <small>分享空间只读，部分下载需要有效账号。</small>
-                  </label>
-                )}
-                {spaceError && <InlineError text={spaceError} />}
-                <div className="space-form-action">
-                  <p>
-                    {space === account.space
-                      ? space === 'personal_new'
-                        ? '当前正在使用个人云。'
-                        : '可连接其他群组或分享。'
-                      : '连接成功后进入文件列表。'}
-                  </p>
-                  <button
-                    className="button primary"
-                    type="submit"
-                    disabled={!native || (space === 'personal_new' && account.space === space)}
-                  >
-                    {busy === 'space' && <Loader2 size={16} className="spin" />}
-                    {busy === 'space'
-                      ? '正在连接…'
-                      : space === 'share'
-                        ? '打开分享'
-                        : space === 'group'
-                          ? '连接群组'
-                          : '连接个人云'}
-                  </button>
-                </div>
-              </fieldset>
-            </form>
-          </>
-        )}
-        {account && (
-          <button
-            className="account-login-toggle"
-            aria-expanded={loginOpen}
-            aria-controls="account-login-form"
-            disabled={!!busy}
-            onClick={() => {
-              setLoginOpen(!loginOpen);
-              setLoginError('');
-            }}
-          >
-            <span>添加账号</span>
-            <span>{loginOpen ? '收起' : '展开'}</span>
-          </button>
-        )}
-        {loginOpen && (
+        <button ref={addAccountButton} className="button secondary" aria-haspopup="dialog" disabled={!!busy}
+          onClick={() => setLoginOpen(true)}>
+          <Plus size={17} />
+          添加账号
+        </button>
+      </div>
+      {loginOpen && !smsRequired && (
+        <RepositoryDialog titleId={titleId} busy={!!busy} onDismiss={closeLogin}
+          returnFocus={addAccountButton.current}>
           <form
             id="account-login-form"
-            className="login-panel"
+            className="login-panel account-login-modal"
             aria-label="登录移动云盘"
             onSubmit={(e) => {
               e.preventDefault();
               void submitLogin();
             }}
           >
-            <h2>{account ? '登录其他账号' : '连接移动云盘'}</h2>
+            <header className="dialog-heading">
+              <h2 id={titleId}>添加账号</h2>
+              <button className="icon-button" type="button" aria-label="关闭" disabled={!!busy}
+                onClick={closeLogin}><X size={20} /></button>
+            </header>
             <fieldset disabled={!!busy}>
               <label className="form-field">
                 登录方式
@@ -422,7 +257,6 @@ export function AccountView({
                   <option value="password">139 邮箱账号与密码</option>
                   <option value="authorization">Authorization 凭据</option>
                   <option value="cookies">139 邮箱 Cookie</option>
-                  <option value="share">免登录打开分享</option>
                 </select>
               </label>
               {method === 'official' ? (
@@ -439,68 +273,7 @@ export function AccountView({
                   </div>
                 </div>
               ) : (
-                <>
-                  <LoginFields
-                    method={method}
-                    config={config}
-                    field={field}
-                    smsRequired={smsRequired}
-                  />
-                  {method !== 'share' && (
-                    <label className="form-field">
-                      登录后连接
-                      <select
-                        value={config.space}
-                        onChange={(e) => {
-                          setConfig((prev) => ({
-                            ...prev,
-                            space: e.target.value as Space,
-                            rootId: '',
-                            cloudId: '',
-                          }));
-                          setLoginError('');
-                        }}
-                      >
-                        <option value="personal_new">个人云</option>
-                        <option value="group">群组云</option>
-                      </select>
-                    </label>
-                  )}
-                  {method !== 'share' && config.space === 'group' && (
-                    <label className="form-field">
-                      群组 ID
-                      <input
-                        required
-                        value={config.cloudId}
-                        onChange={(e) => field('cloudId', e.target.value)}
-                        placeholder="输入群组 ID"
-                      />
-                    </label>
-                  )}
-                  <details className="advanced-login">
-                    <summary>高级选项</summary>
-                    <label className="form-field">
-                      账号显示名称
-                      <input value={config.name} onChange={(e) => field('name', e.target.value)} />
-                    </label>
-                    <label className="form-field">
-                      根目录 ID
-                      <input
-                        value={config.rootId}
-                        onChange={(e) => field('rootId', e.target.value)}
-                        placeholder="留空使用默认目录"
-                      />
-                    </label>
-                    <label className="form-field">
-                      User Domain ID
-                      <input
-                        value={config.userDomainId}
-                        onChange={(e) => field('userDomainId', e.target.value)}
-                        placeholder="用于查询容量"
-                      />
-                    </label>
-                  </details>
-                </>
+                <LoginFields method={method} config={config} field={field} />
               )}
               {loginError && <InlineError text={loginError} />}
               <button className="button primary login-submit" type="submit" disabled={!native}>
@@ -515,16 +288,43 @@ export function AccountView({
                   ? '正在连接…'
                   : method === 'official'
                     ? '检测并复用凭据'
-                    : method === 'share'
-                      ? '打开分享'
-                      : '登录并连接'}
+                    : '登录并连接'}
               </button>
             </fieldset>
-            <p className="account-footnote">凭据在本机加密保存，密码和短信验证码不会持久化。</p>
             {!native && <p className="preview-note">当前为界面预览，登录请使用桌面或移动应用。</p>}
           </form>
-        )}
-      </div>
+        </RepositoryDialog>
+      )}
+      {loginOpen && smsRequired && (
+        <RepositoryDialog compact titleId={smsTitleId} busy={!!busy} onDismiss={cancelVerification}
+          returnFocus={addAccountButton.current}>
+          <form className="login-panel account-login-modal" aria-label="短信验证"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const code = config.smsCode.trim();
+              if (code) void submitLogin(code);
+            }}>
+            <header className="dialog-heading">
+              <h2 id={smsTitleId}>短信验证</h2>
+              <button className="icon-button" type="button" aria-label="关闭" disabled={!!busy}
+                onClick={cancelVerification}><X size={20} /></button>
+            </header>
+            <fieldset disabled={!!busy}>
+              <label className="form-field">
+                短信验证码
+                <input required data-dialog-autofocus inputMode="numeric" autoComplete="one-time-code"
+                  value={config.smsCode} onChange={(event) => field('smsCode', event.target.value)}
+                  placeholder="填写收到的验证码" />
+              </label>
+              {loginError && <InlineError text={loginError} />}
+              <button className="button primary login-submit" type="submit" disabled={!config.smsCode.trim()}>
+                {busy === 'login' && <Loader2 size={17} className="spin" />}
+                {busy === 'login' ? '正在验证…' : '验证并登录'}
+              </button>
+            </fieldset>
+          </form>
+        </RepositoryDialog>
+      )}
     </section>
   );
 }
@@ -542,12 +342,10 @@ function LoginFields({
   method,
   config,
   field,
-  smsRequired,
 }: {
   method: Method;
   config: LoginConfig;
   field: (key: keyof LoginConfig, value: string) => void;
-  smsRequired: boolean;
 }) {
   return (
     <>
@@ -576,19 +374,6 @@ function LoginFields({
               placeholder="输入密码"
             />
           </label>
-          <details open={smsRequired || undefined}>
-            <summary>短信验证（遇到风控时填写）</summary>
-            <label className="form-field">
-              短信验证码
-              <input
-                value={config.smsCode}
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                onChange={(e) => field('smsCode', e.target.value)}
-                placeholder="填写收到的验证码"
-              />
-            </label>
-          </details>
           <details>
             <summary>复用邮箱设备 Cookie（可选）</summary>
             <textarea
@@ -628,20 +413,6 @@ function LoginFields({
             rows={4}
           />
           <small>Cookie 登录保留现有设备上下文。</small>
-        </label>
-      )}
-      {method === 'share' && (
-        <label className="form-field">
-          分享链接
-          <textarea
-            required
-            spellCheck={false}
-            value={config.linkId}
-            onChange={(e) => field('linkId', e.target.value)}
-            placeholder={'分享链接或 link_id\n带提取码：link_id#提取码\n多个分享每行一个'}
-            rows={5}
-          />
-          <small>分享空间只读，部分下载需要有效账号。</small>
         </label>
       )}
     </>

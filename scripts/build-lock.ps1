@@ -3,7 +3,12 @@ function Enter-CmBuildLock {
     # Hold the same OS file lock through Vite and native compilation. Vite clears
     # shared dist before writing it; Rust must not embed that temporary empty tree.
     $cmLockDirectory = Join-Path $ProjectDirectory '.build-tmp'
-    [IO.Directory]::CreateDirectory($cmLockDirectory) | Out-Null
+    $cmLockItem = Get-Item -LiteralPath $cmLockDirectory -Force -ErrorAction SilentlyContinue
+    if ($cmLockItem -and $cmLockItem.Target) {
+        [IO.Directory]::CreateDirectory($cmLockItem.Target) | Out-Null
+    } else {
+        [IO.Directory]::CreateDirectory($cmLockDirectory) | Out-Null
+    }
     $cmLockPath = Join-Path $cmLockDirectory 'client-build.lock'
     $cmLockWatch = [Diagnostics.Stopwatch]::StartNew()
     $cmLockNoticeShown = $false

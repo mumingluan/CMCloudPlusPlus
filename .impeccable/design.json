@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-05T08:38:53.368Z",
+  "generatedAt": "2026-11-10T18:41:07Z",
   "title": "Design System: CMCloud++",
   "extensions": {
     "colorMeta": {
@@ -409,6 +409,36 @@
           "oklch(87% 0.1680 262.01)",
           "oklch(95% 0.1680 262.01)"
         ]
+      },
+      "repository-shadow": {
+        "role": "neutral",
+        "displayName": "对象库浮层阴影",
+        "canonical": "rgb(0 0 0 / 0.18)",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.00 / 0.18)",
+          "oklch(27% 0.0000 0.00 / 0.18)",
+          "oklch(39% 0.0000 0.00 / 0.18)",
+          "oklch(51% 0.0000 0.00 / 0.18)",
+          "oklch(63% 0.0000 0.00 / 0.18)",
+          "oklch(75% 0.0000 0.00 / 0.18)",
+          "oklch(87% 0.0000 0.00 / 0.18)",
+          "oklch(95% 0.0000 0.00 / 0.18)"
+        ]
+      },
+      "repository-backdrop": {
+        "role": "neutral",
+        "displayName": "对象库背景遮罩",
+        "canonical": "rgb(8 18 37 / 0.48)",
+        "tonalRamp": [
+          "oklch(15% 0.0419 261.92 / 0.48)",
+          "oklch(27% 0.0419 261.92 / 0.48)",
+          "oklch(39% 0.0419 261.92 / 0.48)",
+          "oklch(51% 0.0419 261.92 / 0.48)",
+          "oklch(63% 0.0419 261.92 / 0.48)",
+          "oklch(75% 0.0419 261.92 / 0.48)",
+          "oklch(87% 0.0419 261.92 / 0.48)",
+          "oklch(95% 0.0419 261.92 / 0.48)"
+        ]
       }
     },
     "typographyMeta": {
@@ -435,6 +465,42 @@
       "metadata": {
         "displayName": "辅助信息",
         "purpose": "类型、时间、数量等次级信息。"
+      },
+      "repository-title": {
+        "displayName": "对象库解锁标题",
+        "purpose": "对象库新建、解锁及解锁方式修改表单标题。"
+      },
+      "repository-heading-mobile": {
+        "displayName": "手机对象库名称",
+        "purpose": "700px 以内、会话打开前的对象库名称；进入后使用共享面包屑。"
+      },
+      "repository-dialog-title": {
+        "displayName": "对象库浮层标题",
+        "purpose": "管理、缓存设置、凭据确认与上传比对标题。"
+      },
+      "offline-heading": {
+        "displayName": "离线下载标题",
+        "purpose": "离线下载工作区标题。"
+      },
+      "offline-heading-mobile": {
+        "displayName": "手机离线下载标题",
+        "purpose": "700px 以内的离线下载工作区标题。"
+      },
+      "section-title": {
+        "displayName": "连接分区标题",
+        "purpose": "协调器连接与已存连接分区。"
+      },
+      "record-title": {
+        "displayName": "状态记录标题",
+        "purpose": "节点、对象库、存储后端与批次名称。"
+      },
+      "summary-value": {
+        "displayName": "状态汇总数字",
+        "purpose": "上传比对与协调器状态中的对齐数字。"
+      },
+      "supporting": {
+        "displayName": "操作辅助文字",
+        "purpose": "新表单标签、说明和进行状态。"
       }
     },
     "shadows": [
@@ -447,6 +513,11 @@
         "name": "toast",
         "value": "0 8px 28px #18274024",
         "purpose": "临时结果提示。"
+      },
+      {
+        "name": "repository-dialog",
+        "value": "0 16px 48px rgb(0 0 0 / 0.18)",
+        "purpose": "对象库新建、管理、缓存设置、凭据确认与上传比对的外层 modal；内部表单清除重复阴影。"
       }
     ],
     "motion": [
@@ -498,6 +569,13 @@
         "name": "mobile-max",
         "value": "700px"
       }
+    ],
+    "backdrops": [
+      {
+        "name": "repository-modal",
+        "value": "rgb(8 18 37 / 0.48)",
+        "purpose": "对象库编辑与上传比对浮层后方。"
+      }
     ]
   },
   "components": [
@@ -529,9 +607,9 @@
       "name": "删除确认按钮",
       "kind": "button",
       "refersTo": "button-destructive",
-      "description": "确认删除的红底按钮，与对话框中的明确文字配合。",
+      "description": "明确删除确认使用独立 destructive 变体和主题映射；全部凭据删除需连续两次确认。",
       "html": "<button type=\"button\" class=\"ds-button-destructive\">确认删除</button>",
-      "css": ".ds-button-destructive { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 15px; height: 37px; border-radius: 7px; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer; border: 0; background: var(--red, #bc3544); color: var(--surface, #fff); transition: background 0.16s, color 0.16s; } .ds-button-destructive:hover { background: #a62938;  } .ds-button-destructive:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-button-destructive:disabled { cursor: default; opacity: 0.55; } .ds-button-destructive svg { flex-shrink: 0; } @media (max-width: 700px) { .ds-button-destructive { min-height: 48px; height: 48px; } } @media (prefers-reduced-motion: reduce) { .ds-button-destructive { transition: none; } }"
+      "css": ".ds-button-destructive { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 15px; height: 37px; border-radius: 7px; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer; border: 0; background: var(--bg-bc3544, #bc3544); color: var(--fg-fff, #fff); transition: background 0.16s, color 0.16s; } .ds-button-destructive:hover { background: var(--bg-a62938, #a62938);  } .ds-button-destructive:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-button-destructive:disabled { cursor: default; opacity: 0.55; } .ds-button-destructive svg { flex-shrink: 0; } @media (max-width: 700px) { .ds-button-destructive { min-height: 48px; height: 48px; } } @media (prefers-reduced-motion: reduce) { .ds-button-destructive { transition: none; } }"
     },
     {
       "name": "表单字段",
@@ -569,17 +647,57 @@
       "name": "选中文件行",
       "kind": "custom",
       "refersTo": "file-row",
-      "description": "选择、文件类型和对齐数字形成可扫描的文件行；标本以内联行展示。",
+      "description": "普通目录和对象库共用 App.tsx 的虚拟文件行、图标视图、选择与菜单。桌面空白处框选，手机长按和复选框滑选；共享 OperationDialog 处理常规操作，其手机页脚动作至少 48 × 48px。标本为宽松行，桌面紧凑模式为 48px。",
       "html": "<div class=\"ds-file-row ds-row-selected\"><label class=\"ds-checkbox-wrap\"><input class=\"ds-file-checkbox\" type=\"checkbox\" checked aria-label=\"选择 工作文档\" /></label><button type=\"button\" class=\"ds-file-name\"><span class=\"ds-folder-glyph\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg></span><span class=\"ds-file-copy\"><strong class=\"ds-file-title\">工作文档</strong><small class=\"ds-file-kind\">文件夹</small></span></button><span class=\"ds-file-size\">—</span><button type=\"button\" class=\"ds-row-more\" aria-label=\"查看 工作文档 详情\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"19\" height=\"19\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"19\" cy=\"12\" r=\"1\"/><circle cx=\"5\" cy=\"12\" r=\"1\"/></svg></button></div>",
-      "css": ".ds-file-row { display: flex; align-items: center; height: 64px; border-bottom: 1px solid #f0f2f6; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 13px; color: var(--text, #263246); transition: background 0.12s; } .ds-file-row:hover { background: #f8faff; } .ds-file-row.ds-row-selected { background: #eff5ff; } .ds-checkbox-wrap { width: 46px; min-width: 44px; height: 100%; flex-shrink: 0; display: grid; place-items: center; } .ds-file-checkbox { width: 14px; height: 14px; margin: 0; accent-color: var(--accent, #2861dc); cursor: pointer; } .ds-file-name { flex: 1; min-width: 0; height: 100%; padding: 0 10px; border: 0; background: transparent; display: flex; align-items: center; gap: 13px; text-align: left; cursor: pointer; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; } .ds-file-copy { min-width: 0; } .ds-file-title { display: block; font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #354761; } .ds-file-kind { display: block; color: #63738a; font-size: 12px; margin-top: 4px; } .ds-folder-glyph { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; color: #d9a448; } .ds-folder-glyph svg { fill: #f7d982; stroke: #d7a449; } .ds-file-size { width: 115px; padding: 0 10px; flex-shrink: 0; color: var(--muted, #596a82); font-variant-numeric: tabular-nums; } .ds-row-more { width: 40px; min-width: 40px; height: 40px; margin: 0 6px 0 1px; border: 0; background: transparent; border-radius: 6px; color: var(--muted, #596a82); opacity: 0; display: inline-flex; justify-content: center; align-items: center; cursor: pointer; } .ds-file-row:hover .ds-row-more, .ds-file-row:focus-within .ds-row-more { opacity: 1; } .ds-row-more:hover { background: #edf2fa; color: #315884; } .ds-file-name:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-file-checkbox:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-row-more:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } @media (max-width: 900px) { .ds-row-more { opacity: 1; } } @media (max-width: 700px) { .ds-checkbox-wrap { min-width: 48px; width: 48px; min-height: 48px; cursor: pointer; } .ds-file-name { gap: 10px; padding: 0 5px; } .ds-file-title { font-size: 13px; } .ds-file-kind { font-size: 11px; } .ds-file-size { width: 71px; padding: 0 3px; font-size: 11px; } .ds-row-more { min-width: 48px; width: 48px; min-height: 48px; height: 48px; margin: 0 4px 0 0; } } @media (prefers-reduced-motion: reduce) { .ds-file-row { transition: none; } }"
+      "css": ".ds-file-row { display: flex; align-items: center; height: 72px; border-bottom: 1px solid #f0f2f6; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 13px; color: var(--text, #263246); transition: background 0.12s; } .ds-file-row:hover { background: var(--bg-f8faff, #f8faff); } .ds-file-row.ds-row-selected { background: var(--bg-eff5ff, #eff5ff); } .ds-checkbox-wrap { width: 46px; min-width: 44px; height: 100%; flex-shrink: 0; display: grid; place-items: center; } .ds-file-checkbox { width: 14px; height: 14px; margin: 0; accent-color: var(--accent, #2861dc); cursor: pointer; } .ds-file-name { flex: 1; min-width: 0; height: 100%; padding: 0 10px; border: 0; background: transparent; display: flex; align-items: center; gap: 13px; text-align: left; cursor: pointer; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; } .ds-file-copy { min-width: 0; } .ds-file-title { display: block; font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-354761, #354761); } .ds-file-kind { display: block; color: var(--fg-63738a, #63738a); font-size: 12px; margin-top: 4px; } .ds-folder-glyph { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; color: #d9a448; } .ds-folder-glyph svg { fill: #f7d982; stroke: #d7a449; } .ds-file-size { width: 115px; padding: 0 10px; flex-shrink: 0; color: var(--muted, #596a82); font-variant-numeric: tabular-nums; } .ds-row-more { width: 40px; min-width: 40px; height: 40px; margin: 0 6px 0 1px; border: 0; background: transparent; border-radius: 6px; color: var(--muted, #596a82); opacity: 0; display: inline-flex; justify-content: center; align-items: center; cursor: pointer; } .ds-file-row:hover .ds-row-more, .ds-file-row:focus-within .ds-row-more { opacity: 1; } .ds-row-more:hover { background: #edf2fa; color: #315884; } .ds-file-name:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-file-checkbox:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-row-more:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } @media (max-width: 900px) { .ds-row-more { opacity: 1; } } @media (max-width: 700px) { .ds-checkbox-wrap { min-width: 48px; width: 48px; min-height: 48px; cursor: pointer; } .ds-file-name { gap: 10px; padding: 0 5px; } .ds-file-title { font-size: 14px; } .ds-file-kind { font-size: 12px; } .ds-file-size { width: 71px; padding: 0 3px; font-size: 11px; } .ds-row-more { min-width: 48px; width: 48px; min-height: 48px; height: 48px; margin: 0 4px 0 0; } } @media (prefers-reduced-motion: reduce) { .ds-file-row { transition: none; } }"
     },
     {
       "name": "传输详情",
       "kind": "custom",
       "refersTo": "transfer-details",
-      "description": "可滚动详情让长路径和完整失败原因换行、可选择，并保留恢复操作。",
+      "description": "普通文件与对象库共用队列和可滚动详情，保留完整路径、错误及恢复操作。加密、解密和本机预览准备是可读任务阶段；临时解密预览禁用复制链接并在关闭时请求释放，原生清理另行验收。",
       "html": "<section class=\"ds-transfer-dialog\" role=\"dialog\" aria-label=\"传输详情\"><div class=\"ds-dialog-heading\"><h2 class=\"ds-dialog-title\">传输详情</h2><button type=\"button\" class=\"ds-dialog-close\" aria-label=\"关闭传输详情\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"19\" height=\"19\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M18 6 6 18\"/><path d=\"m6 6 12 12\"/></svg></button></div><h3 class=\"ds-transfer-title\">家庭影像_2026_示例.zip</h3><dl class=\"ds-transfer-facts\"><dt>状态</dt><dd>传输失败</dd><dt>进度</dt><dd>12 GB / 32 GB</dd><dt>本地路径</dt><dd>D:\\示例下载\\家庭归档\\2026年完整影像与照片备份\\家庭影像_2026_示例.zip</dd></dl><div class=\"ds-transfer-error\" role=\"alert\"><strong>失败原因</strong><p class=\"ds-error-copy\">示例错误：本地磁盘空间不足，无法继续写入下载分片。请释放下载位置的空间，然后点击重试。</p></div><div class=\"ds-dialog-actions\"><button type=\"button\" class=\"ds-detail-secondary\">关闭</button><button type=\"button\" class=\"ds-detail-primary\">重试任务</button></div></section>",
       "css": ".ds-transfer-dialog { width: 460px; max-width: calc(100vw - 28px); max-height: calc(100dvh - 40px); overflow: auto; padding: 23px; border: 0; border-radius: 11px; background: var(--surface, #fff); box-shadow: 0 18px 70px #14294435; color: var(--text, #263246); font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; } .ds-dialog-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 25px; } .ds-dialog-title { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; } .ds-dialog-close { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 6px; background: transparent; color: var(--muted, #596a82); cursor: pointer; flex-shrink: 0; } .ds-dialog-close:hover { background: #edf2fa; color: #315884; } .ds-dialog-close:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-transfer-title { margin: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; line-height: 1.8; } .ds-transfer-facts { font-size: 13px; margin: 20px 0; } .ds-transfer-facts dt { color: var(--muted, #596a82); margin: 14px 0 5px; } .ds-transfer-facts dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; user-select: text; } .ds-transfer-error { padding: 15px; background: #fdf0f2; color: #9d3041; border-radius: 6px; font-size: 13px; } .ds-error-copy { margin: 8px 0 0; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; } .ds-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 26px; } .ds-detail-secondary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 15px; height: 37px; border-radius: 7px; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer; border: 1px solid #dce2eb; background: var(--surface, #fff); color: #4f6079; transition: background 0.16s, color 0.16s; } .ds-detail-secondary:hover:not(:disabled) { background: #f5f7fb; border-color: #c5d0e2; } .ds-detail-secondary:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-detail-secondary:disabled { cursor: default; opacity: 0.55; } .ds-detail-secondary svg { flex-shrink: 0; } @media (max-width: 700px) { .ds-detail-secondary { min-height: 48px; height: 48px; } } @media (prefers-reduced-motion: reduce) { .ds-detail-secondary { transition: none; } } .ds-detail-primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 15px; height: 37px; border-radius: 7px; font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer; border: 0; background: var(--accent, #2861dc); color: var(--surface, #fff); transition: background 0.16s, color 0.16s; } .ds-detail-primary:hover:not(:disabled) { background: var(--accent-hover, #184fc3);  } .ds-detail-primary:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-detail-primary:disabled { cursor: default; opacity: 0.55; } .ds-detail-primary svg { flex-shrink: 0; } @media (max-width: 700px) { .ds-detail-primary { min-height: 48px; height: 48px; } } @media (prefers-reduced-motion: reduce) { .ds-detail-primary { transition: none; } } @media (max-width: 700px) { .ds-transfer-dialog { padding: 20px; } .ds-dialog-title { font-size: 17px; } .ds-dialog-close { min-width: 48px; width: 48px; min-height: 48px; height: 48px; } }"
+    },
+    {
+      "name": "AxuanStor 文件夹标记",
+      "kind": "custom",
+      "refersTo": "repository-mark",
+      "description": "已确认对象库的文件夹右下角显示 A 标记；默认在同一 App 文件浏览器中打开逻辑目录，三点菜单提供管理和普通文件夹入口。进入后共享工具栏显示管理与退出，隐藏新建对象库。",
+      "html": "<span class=\"ds-repository-folder\" aria-label=\"示例 AxuanStor 对象库文件夹\"><svg width=\"25\" height=\"25\" viewBox=\"0 0 24 24\" fill=\"#f7d982\" stroke=\"#d7a449\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/></svg><span class=\"ds-repository-badge\"><svg class=\"ds-axuanstor-mark\" role=\"img\" aria-label=\"AxuanStor 对象库\" viewBox=\"0 0 16 16\"><rect x=\".5\" y=\".5\" width=\"15\" height=\"15\" rx=\"4\" fill=\"currentColor\"/><path d=\"m4 12 4-8 4 8M5.7 9h4.6\" fill=\"none\" stroke=\"white\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></span></span>",
+      "css": ".ds-repository-folder { display: inline-flex; position: relative; } .ds-repository-badge { position: absolute; right: -5px; bottom: -4px; line-height: 0; border: 2px solid var(--surface, #fff); border-radius: 6px; } .ds-axuanstor-mark { width: 18px; height: 18px; color: var(--accent, #2861dc); }"
+    },
+    {
+      "name": "对象库创建与管理",
+      "kind": "custom",
+      "refersTo": "repository-credential-dialog",
+      "description": "会话控制器管理新建、解锁与凭据修改的紧凑 modal，共享浏览器工具栏提供管理入口。记住信息默认未选；提交和密钥选择期间锁定相关控件及取消。浏览器 fixture 显示示例标识，原生安全存储另行验收。",
+      "html": "<section class=\"ds-repository-management\" aria-labelledby=\"ds-repository-manage-title\"><h2 id=\"ds-repository-manage-title\">管理对象库</h2><p>示例数据</p><dl><div><dt>名称</dt><dd>示例对象库</dd></div><div><dt>类型</dt><dd>加密对象库</dd></div><div><dt>对象库 ID</dt><dd class=\"ds-repository-id\">00000000000000000000000000000000</dd></div><div><dt>解锁方式</dt><dd>密码、密钥</dd></div></dl><div class=\"ds-repository-management-actions\"><button type=\"button\" class=\"ds-repository-secondary\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><rect width=\"18\" height=\"11\" x=\"3\" y=\"11\" rx=\"2\"/><path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/></svg>修改密码</button><button type=\"button\" class=\"ds-repository-secondary\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><circle cx=\"16\" cy=\"8\" r=\"5\"/><path d=\"m12.5 11.5-9 9H1v-3l9-9M5 17l2 2\"/></svg>更换密钥</button></div><p>修改后请使用新凭据解锁。已解锁设备及持有旧密钥和历史副本的设备仍可能访问原有内容。</p><div class=\"ds-repository-management-footer\"><button type=\"button\" class=\"ds-repository-primary\">完成</button></div></section>",
+      "css": ".ds-repository-management { width: min(440px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: auto; padding: 24px; border-radius: 11px; background: var(--surface, #fff); color: var(--text, #263246); box-shadow: 0 16px 48px rgb(0 0 0 / 0.18); font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; display: flex; flex-direction: column; gap: 20px; } .ds-repository-management h2 { margin: 0; font-size: 21px; } .ds-repository-management dl { display: flex; flex-direction: column; gap: 14px; margin: 0; } .ds-repository-management dl > div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 12px; } .ds-repository-management dt { color: var(--muted, #596a82); font-size: 13px; } .ds-repository-management dd { margin: 0; overflow-wrap: anywhere; } .ds-repository-id { font-size: 12px; font-variant-numeric: tabular-nums; } .ds-repository-management-actions { display: flex; flex-wrap: wrap; gap: 10px; } .ds-repository-management p { margin: 0; color: var(--muted, #596a82); font-size: 13px; line-height: 1.65; } .ds-repository-management-footer { display: flex; justify-content: flex-end; } .ds-repository-secondary, .ds-repository-primary { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 37px; padding: 0 15px; border-radius: 7px; font: 500 14px 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; cursor: pointer; } .ds-repository-secondary { border: 1px solid var(--edge-dce2eb, #dce2eb); background: var(--surface, #fff); color: var(--fg-4f6079, #4f6079); } .ds-repository-primary { border: 0; background: var(--accent, #2861dc); color: #fff; } .ds-repository-secondary:hover { background: var(--bg-f5f7fb, #f5f7fb); border-color: var(--edge-c5d0e2, #c5d0e2); } .ds-repository-primary:hover { background: var(--accent-hover, #184fc3); } .ds-repository-management button:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-repository-management button:disabled { opacity: 0.55; cursor: default; } @media (max-width: 700px) { .ds-repository-management button { min-height: 48px; min-width: 48px; } } @media (max-width: 600px) { .ds-repository-management { padding: 20px; } .ds-repository-management-actions > button { flex: 1; } }"
+    },
+    {
+      "name": "对象库上传比对",
+      "kind": "custom",
+      "refersTo": "repository-plan",
+      "description": "全批比较逻辑大小、新增内容和实际上传量，单独确认替换后加入现有传输队列。管理与比对关闭后等共享工具栏解除忙碌再返回焦点；fixture 内容明确标为示例。",
+      "html": "<section class=\"ds-repository-plan\" aria-label=\"上传比对示例\"><header class=\"ds-plan-heading\"><h2>确认上传</h2><button type=\"button\" class=\"ds-plan-close\" aria-label=\"关闭上传比对\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M18 6 6 18M6 6l12 12\"/></svg></button></header><p>示例数据 · 已比对 4 个文件、已有内容及本批重复项。</p><dl class=\"ds-plan-summary\"><div><dt>逻辑文件</dt><dd>6 MB</dd></div><div><dt>新增内容</dt><dd>1 份</dd></div><div><dt>需上传</dt><dd>2 MB</dd></div></dl><div class=\"ds-plan-items\"><div><span>示例/说明.pdf</span><small>相同路径，跳过</small></div><div><span>示例/已有副本.pdf</span><small>复用已有内容</small></div><div><span>示例/照片副本.jpg</span><small>复用本批文件</small></div><div><span>示例/照片.jpg</span><small>上传新内容</small></div></div><footer class=\"ds-plan-actions\"><button type=\"button\" class=\"ds-plan-cancel\">取消</button><button type=\"button\" class=\"ds-plan-confirm\">确认上传</button></footer></section>",
+      "css": ".ds-repository-plan { width: min(100% - 32px, 640px); max-height: calc(100dvh - 48px); overflow: auto; padding: 24px; border-radius: 11px; background: var(--surface, #fff); color: var(--text, #263246); box-shadow: 0 16px 48px rgb(0 0 0 / 0.18); font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; display: flex; flex-direction: column; gap: 18px; } .ds-plan-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; } .ds-plan-heading h2 { margin: 0; font-size: 21px; font-weight: 600; letter-spacing: -0.01em; } .ds-repository-plan p { margin: 0; color: var(--muted, #596a82); line-height: 1.65; } .ds-plan-close { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 6px; background: transparent; color: var(--muted, #596a82); cursor: pointer; } .ds-plan-close:hover { background: var(--bg-edf2fa, #edf2fa); color: var(--fg-315884, #315884); } .ds-plan-summary { display: flex; gap: 24px; flex-wrap: wrap; margin: 0; padding: 16px 0; border-block: 1px solid var(--border, #e6eaf1); } .ds-plan-summary dt { color: var(--muted, #596a82); font-size: 12px; } .ds-plan-summary dd { margin: 6px 0 0; font-size: 18px; font-variant-numeric: tabular-nums; } .ds-plan-items { max-height: 40dvh; overflow: auto; } .ds-plan-items > div { display: flex; flex-direction: column; gap: 4px; padding: 10px 0; border-bottom: 1px solid var(--border, #e6eaf1); overflow-wrap: anywhere; } .ds-plan-items small { font-size: 14px; color: var(--muted, #596a82); } .ds-plan-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 26px; } .ds-plan-cancel, .ds-plan-confirm { height: 37px; border-radius: 7px; padding: 0 15px; font: 500 14px 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; cursor: pointer; } .ds-plan-cancel { border: 1px solid var(--edge-dce2eb, #dce2eb); background: var(--bg-fff, #fff); color: var(--fg-4f6079, #4f6079); } .ds-plan-confirm { border: 0; background: var(--accent, #2861dc); color: #fff; } .ds-plan-cancel:hover { background: var(--bg-f5f7fb, #f5f7fb); border-color: var(--edge-c5d0e2, #c5d0e2); } .ds-plan-confirm:hover { background: var(--accent-hover, #184fc3); } .ds-repository-plan button:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } @media (max-width: 700px) { .ds-repository-plan { padding: 20px; } .ds-repository-plan button { min-height: 48px; min-width: 48px; } .ds-plan-close { width: 48px; } .ds-plan-summary { gap: 20px; } }"
+    },
+    {
+      "name": "离线任务详情",
+      "kind": "custom",
+      "refersTo": "offline-task-summary",
+      "description": "离线页以六个状态视图组织返回信息；任务可展开校验和、原会话与历史。连接和解锁保存均需显式选择；原生脱敏及服务端行为仍待验收。",
+      "html": "<details class=\"ds-coordinator-task\" open><summary><svg class=\"ds-task-disclosure\" width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"m6 9 6 6 6-6\"/></svg><strong>示例/归档.zip</strong><span>上传</span><span>1 GB / 2 GB</span><span>示例节点</span></summary><dl class=\"ds-coordinator-details\"><div><dt>任务</dt><dd>界面演示 · demo-task</dd></div><div><dt>对象库 / 批次</dt><dd>示例对象库 / 示例批次</dd></div><div><dt>完整校验和</dt><dd>示例：0000000000000000000000000000000000000000000000000000000000000000</dd></div><div><dt>原上传会话</dt><dd>已保留 · 1 个已确认分片</dd></div><div><dt>尝试 / 历史</dt><dd>1 / 2</dd></div><div><dt>最近更新</dt><dd>示例更新时间</dd></div></dl></details>",
+      "css": ".ds-coordinator-task { border-bottom: 1px solid var(--border, #e6eaf1); color: var(--text, #263246); font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; } .ds-coordinator-task > summary { position: relative; display: grid; grid-template-columns: minmax(180px, 1fr) 70px 170px 130px; align-items: center; gap: 16px; padding: 17px 4px 17px 24px; cursor: pointer; color: var(--muted, #596a82); font-size: 12px; } .ds-coordinator-task strong { font-size: 14px; font-weight: 500; color: var(--text, #263246); overflow-wrap: anywhere; } .ds-task-disclosure { position: absolute; left: 2px; top: 18px; } .ds-coordinator-task[open] .ds-task-disclosure { transform: rotate(180deg); } .ds-coordinator-task > summary:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-coordinator-details { display: grid; gap: 12px; margin: 0; padding: 16px 4px 22px; font-size: 12px; } .ds-coordinator-details > div { display: grid; grid-template-columns: 140px 1fr; gap: 16px; } .ds-coordinator-details dt { color: var(--muted, #596a82); } .ds-coordinator-details dd { margin: 0; min-width: 0; overflow-wrap: anywhere; } @media (max-width: 700px) { .ds-coordinator-task > summary { min-height: 48px; grid-template-columns: 1fr auto; gap: 9px 12px; } .ds-coordinator-task > summary > strong, .ds-coordinator-task > summary > span:last-child { grid-column: 1 / -1; } .ds-coordinator-details > div { grid-template-columns: 96px 1fr; gap: 10px; } }"
+    },
+    {
+      "name": "对象库缓存管理",
+      "kind": "custom",
+      "refersTo": "repository-dialog",
+      "description": "设置中的缓存 modal 展示各对象库名称、可折行 ID、大小和删除动作；使用中的缓存说明先退出并禁用删除。手机记录收为单列，动作至少 48 × 48px。",
+      "html": "<section class=\"ds-repository-cache\" aria-labelledby=\"ds-cache-title\"><h2 id=\"ds-cache-title\">本机对象库清单缓存</h2><p class=\"ds-cache-demo\">示例数据</p><ul><li><div><strong>归档</strong><span class=\"ds-cache-id\">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</span><span>32 MB</span></div><button type=\"button\" class=\"ds-cache-delete\">删除缓存</button></li><li><div><strong>私密资料</strong><span class=\"ds-cache-id\">bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</span><span>8 MB · 使用中，请先退出对象库</span></div><button type=\"button\" class=\"ds-cache-delete\" disabled>删除缓存</button></li></ul><footer><button type=\"button\" class=\"ds-cache-refresh\">刷新</button><button type=\"button\" class=\"ds-cache-close\">关闭</button></footer></section>",
+      "css": ".ds-repository-cache { width: min(640px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: auto; padding: 20px; border-radius: 11px; background: var(--surface, #fff); color: var(--text, #263246); box-shadow: 0 16px 48px rgb(0 0 0 / 0.18); font-family: 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14px; } .ds-repository-cache h2 { margin: 0 0 25px; font-size: 18px; font-weight: 600; } .ds-cache-demo { color: var(--muted, #596a82); font-size: 12px; } .ds-repository-cache ul { list-style: none; margin: 16px 0; padding: 0; max-height: 55vh; overflow: auto; } .ds-repository-cache li { display: flex; align-items: center; gap: 16px; padding: 14px 0; border-bottom: 1px solid var(--border, #e6eaf1); } .ds-repository-cache li > div { display: grid; gap: 5px; min-width: 0; flex: 1; } .ds-repository-cache strong, .ds-cache-id { overflow-wrap: anywhere; } .ds-repository-cache li span { color: var(--muted, #596a82); font-size: 12px; } .ds-cache-id { font-variant-numeric: tabular-nums; } .ds-repository-cache button { display: inline-flex; align-items: center; justify-content: center; height: 37px; padding: 0 15px; border: 0; border-radius: 7px; font: 500 14px 'Segoe UI', 'Noto Sans SC', 'Microsoft YaHei', sans-serif; cursor: pointer; } .ds-cache-delete, .ds-cache-refresh { background: transparent; } .ds-cache-delete { color: var(--fg-bb4351, #bb4351); } .ds-cache-refresh { color: var(--fg-576a86, #576a86); } .ds-cache-close { background: var(--bg-fff, #fff); color: var(--fg-4f6079, #4f6079); border: 1px solid var(--edge-dce2eb, #dce2eb) !important; } .ds-repository-cache button:hover:not(:disabled) { background: var(--bg-f5f7fb, #f5f7fb); } .ds-repository-cache button:focus-visible { outline: 2px solid var(--accent, #2861dc); outline-offset: 3px; } .ds-repository-cache button:disabled { opacity: 0.55; cursor: default; } @media (max-width: 700px) { .ds-repository-cache { padding: 16px; } .ds-repository-cache li { align-items: flex-start; flex-direction: column; gap: 10px; } .ds-repository-cache button { min-height: 48px; min-width: 48px; } }"
     }
   ],
   "narrative": {
@@ -589,7 +707,7 @@
       "白色工作面、灰蓝色导航、清晰的蓝色重点操作。",
       "紧凑文字层级与规整行列，数字使用等宽数字特性。",
       "轻度圆角、细分隔线，浮层具有明确层级。",
-      "手机控件保持可触达，完整信息通过详情展开。"
+      "手机控件保持可触达，文件操作通过统一菜单展开。"
     ],
     "rules": [
       {

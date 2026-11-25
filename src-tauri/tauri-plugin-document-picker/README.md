@@ -32,21 +32,15 @@ storage permissions and exposes no JavaScript commands.
 
 ## Android transfer lifetime
 
-`begin_transfers()` starts a `dataSync` foreground service with an ongoing transfer notification
-and a partial wake lock. Call it on the user's queue action, refresh every 30–60 seconds while
-work is active, and call `end_transfers()` when idle. Both the lease and wake-lock timeout are
-two minutes, so an absent Rust runtime cannot leave an unlimited wake lock. The service does
-not restart a killed Rust runtime; the persistent queue provides recovery on the next launch.
+The Rust queue refreshes `begin_transfers_with_status()` every ten seconds while work is live, independently of WebView timers. The bridge carries aggregate byte progress, counts, and upload/download speeds for the ongoing notification. Idle queues call `end_transfers()` and release resources.
 
-`foreground_status()` returns `{supported, active, notificationPermission, reason}`. The plugin
-declares Android 13 notification permission but does not prompt automatically or block transfers
-if it is denied; the foreground service can still be visible in the system's active-app UI.
-Starting from the background can be restricted. Android 15 and newer limit `dataSync` foreground
-services to six background hours in a 24-hour period; `onTimeout()` stops the service safely and
-sets a status reason. Keep the application foregrounded or reopen it to continue after OS limits.
-Persisted URI grants also cannot survive document deletion, grant revocation, or provider removal.
+Android 14+ prefers a user-initiated data transfer `JobService`, scheduled while the activity is visible, with network constraints and estimated transfer sizes. Older releases, or a rejected job request, use the `dataSync` foreground service. Both paths hold a partial CPU wake lock, high-performance Wi-Fi lock and an Internet network request, and keep the visible activity's screen awake during transfers. The Kotlin watchdog checks a three-minute native lease; locks are released when the queue is idle or the runtime stops. Transient Android network failures continue retrying with capped backoff until recovery or explicit pause/cancel.
 
-Reference: [Android foreground service timeouts](https://developer.android.com/develop/background-work/services/fgs/timeout).
+Notification and battery-optimization exemption prompts are requested once from the visible app. The Android settings entry can request them again and open the app's system settings for manufacturer-specific background permissions. These are user-approved system settings. The job/service does not resurrect a killed Rust runtime; the persisted queue resumes on the next launch. Force-stop and system health restrictions still apply. Android 15's six-hour dataSync service budget applies to the foreground-service fallback and its timeout is handled safely.
+
+`foreground_status()` returns `{supported, active, notificationPermission, reason}`. Transfer argument fields and service classes are retained by consumer ProGuard rules.
+
+References: [User-initiated data transfer](https://developer.android.com/develop/background-work/background-tasks/uidt), [foreground service timeouts](https://developer.android.com/develop/background-work/services/fgs/timeout), [Doze and App Standby](https://developer.android.com/training/monitoring-device-state/doze-standby).
 
 References: [Android Storage Access Framework](https://developer.android.com/training/data-storage/shared/documents-files),
 [AOSP URI grant implementation](https://android.googlesource.com/platform/frameworks/base/+/master/services/core/java/com/android/server/uri/UriGrantsManagerService.java).

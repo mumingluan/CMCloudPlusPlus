@@ -1,27 +1,36 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import type { LucideIcon } from 'lucide-react';
+import { FileMenuDialog } from './FileMenuDialog';
 
 export type FileMenuItem = {
   label: string;
   icon: LucideIcon;
   action: () => void;
   danger?: boolean;
+  disabled?: boolean;
 };
 
 export function FileContextMenu({
   x,
   y,
   items,
+  mobile,
+  title = '文件操作',
+  target,
   onClose,
 }: {
   x: number;
   y: number;
   items: FileMenuItem[];
+  mobile?: boolean;
+  title?: string;
+  target?: string;
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ left: x, top: y });
   useLayoutEffect(() => {
+    if (mobile) return;
     const menu = ref.current!;
     const previous = document.activeElement as HTMLElement | null;
     const bounds = menu.getBoundingClientRect();
@@ -29,7 +38,7 @@ export function FileContextMenu({
       left: Math.max(8, Math.min(x, window.innerWidth - bounds.width - 8)),
       top: Math.max(8, Math.min(y, window.innerHeight - bounds.height - 8)),
     });
-    menu.querySelector<HTMLButtonElement>('button')?.focus();
+    menu.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus({ preventScroll: true });
     const outside = (event: PointerEvent) => {
       if (!menu.contains(event.target as Node)) onClose();
     };
@@ -48,18 +57,20 @@ export function FileContextMenu({
       window.removeEventListener('blur', dismiss);
       if (menu.contains(document.activeElement)) previous?.focus();
     };
-  }, [x, y, onClose]);
-  return (
+  }, [x, y, mobile, onClose]);
+  const menu = (
     <div
-      ref={ref}
-      className="file-context-menu"
+      ref={mobile ? undefined : ref}
+      className={mobile ? undefined : 'file-context-menu'}
       role="menu"
-      aria-label="文件操作"
-      style={position}
+      aria-label={title}
+      style={mobile ? undefined : position}
       onKeyDown={(event) => {
-        const buttons = [...ref.current!.querySelectorAll<HTMLButtonElement>('button')];
+        const buttons = [
+          ...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)'),
+        ];
         const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
-        if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        if (buttons.length && ['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
           event.preventDefault();
           const next =
             event.key === 'Home'
@@ -68,16 +79,18 @@ export function FileContextMenu({
                 ? buttons.length - 1
                 : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length;
           buttons[next]?.focus();
-        } else if (event.key === 'Escape' || event.key === 'Tab') {
+        } else if (!mobile && (event.key === 'Escape' || event.key === 'Tab')) {
           event.preventDefault();
           onClose();
         }
       }}
     >
-      {items.map(({ label, icon: Icon, action, danger }) => (
+      {items.map(({ label, icon: Icon, action, danger, disabled }) => (
         <button
+          type="button"
           key={label}
           role="menuitem"
+          disabled={disabled}
           className={danger ? 'danger' : ''}
           onClick={() => {
             onClose();
@@ -90,4 +103,9 @@ export function FileContextMenu({
       ))}
     </div>
   );
+  return mobile ? (
+    <FileMenuDialog title={title} target={target} closeLabel="关闭操作菜单" onClose={onClose}>
+      {menu}
+    </FileMenuDialog>
+  ) : menu;
 }

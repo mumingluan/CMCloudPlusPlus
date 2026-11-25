@@ -33,7 +33,8 @@ impl Store {
                 local_path TEXT NOT NULL, name TEXT NOT NULL, total_bytes INTEGER NOT NULL,
                 completed_bytes INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
                 error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0, upload_state TEXT, account_scope TEXT NOT NULL DEFAULT ''
+                attempts INTEGER NOT NULL DEFAULT 0, upload_state TEXT, account_scope TEXT NOT NULL DEFAULT '', repository_state TEXT,
+                shared_download_uri TEXT
             );
             CREATE INDEX IF NOT EXISTS transfer_status_created ON transfers(status, created_at);
             CREATE INDEX IF NOT EXISTS transfer_path_status ON transfers(local_path, status);
@@ -55,6 +56,18 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         }
+        let has_repository=db.prepare("PRAGMA table_info(transfers)").map_err(|e|e.to_string())?.query_map([],|row|row.get::<_,String>(1)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?.iter().any(|name|name=="repository_state");
+        if !has_repository{db.execute("ALTER TABLE transfers ADD COLUMN repository_state TEXT",[]).map_err(|e|e.to_string())?;}
+        let has_preview=db.prepare("PRAGMA table_info(transfers)").map_err(|e|e.to_string())?.query_map([],|row|row.get::<_,String>(1)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?.iter().any(|name|name=="repository_preview");
+        if !has_preview{db.execute("ALTER TABLE transfers ADD COLUMN repository_preview INTEGER NOT NULL DEFAULT 0",[]).map_err(|e|e.to_string())?;}
+        let has_shared_download = db.prepare("PRAGMA table_info(transfers)").map_err(|e| e.to_string())?
+            .query_map([], |row| row.get::<_, String>(1)).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+            .iter().any(|name| name == "shared_download_uri");
+        if !has_shared_download {
+            db.execute("ALTER TABLE transfers ADD COLUMN shared_download_uri TEXT", []).map_err(|e| e.to_string())?;
+        }
+        db.execute("CREATE INDEX IF NOT EXISTS transfer_repository_preview ON transfers(repository_preview) WHERE repository_preview=1",[]).map_err(|e|e.to_string())?;
         db.execute("CREATE INDEX IF NOT EXISTS transfer_scope_status ON transfers(account_scope,status,created_at)", []).map_err(|e|e.to_string())?;
         db.execute_batch("CREATE INDEX IF NOT EXISTS transfer_history_created ON transfers(created_at DESC);
             CREATE INDEX IF NOT EXISTS transfer_active_priority ON transfers(CASE status WHEN 'running' THEN 0 WHEN 'failed' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END,created_at DESC) WHERE status NOT IN ('completed','cancelled');
@@ -122,17 +135,7 @@ impl Store {
             .map_err(|_| "保存的凭据格式无效，请重新登录".to_string())
     }
 
-    pub fn delete_account(&self) -> Result<(), String> {
-        let _lock = self
-            .vault_lock
-            .lock()
-            .map_err(|_| "凭据存储不可用".to_string())?;
-        let path = self.directory.join("account.vault");
-        if path.exists() {
-            fs::remove_file(path).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
+
 
     #[cfg(target_os = "windows")]
     pub(crate) fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -206,12 +209,12 @@ impl Store {
 
     pub fn summary(&self) -> Result<serde_json::Value, String> {
         let db = self.db.lock().map_err(|_| "传输数据库不可用".to_string())?;
-        let mut statement = db.prepare("SELECT status, COUNT(*), COALESCE(SUM(total_bytes),0), COALESCE(SUM(completed_bytes),0) FROM transfers GROUP BY status")
+        let mut statement = db.prepare("SELECT status, COUNT(*), COALESCE(SUM(total_bytes),0), COALESCE(SUM(completed_bytes),0), direction FROM transfers GROUP BY direction,status")
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |row| {
                 Ok(serde_json::json!({
-                    "status": row.get::<_, String>(0)?, "count":row.get::<_, u64>(1)?,
+                    "status": row.get::<_, String>(0)?, "count":row.get::<_, u64>(1)?, "direction":row.get::<_, String>(4)?,
                     "totalBytes":row.get::<_, u64>(2)?, "completedBytes":row.get::<_, u64>(3)?
                 }))
             })
@@ -226,10 +229,20 @@ impl Store {
             .lock()
             .map_err(|_| "传输数据库不可用".to_string())?
             .execute(
-                "DELETE FROM transfers WHERE status IN ('completed','cancelled')",
+                "DELETE FROM transfers WHERE status IN ('completed','cancelled') AND repository_preview=0",
                 params![],
             )
             .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_completed(&self, id: &str) -> Result<(), String> {
+        let removed = self.db.lock().map_err(|_| "传输数据库不可用".to_string())?
+            .execute("DELETE FROM transfers WHERE id=? AND status='completed' AND repository_preview=0", [id])
+            .map_err(|e| e.to_string())?;
+        if removed == 0 {
+            return Err("完成记录不存在或已经清除".into());
+        }
+        Ok(())
     }
 }
 
@@ -341,6 +354,26 @@ mod tests {
     }
 
     #[test]
+    fn removing_completed_records_preserves_files_and_active_preview_records() {
+        let directory = TestDirectory::new();
+        let store = Store::new(&directory.0).unwrap();
+        let file = directory.0.join("finished.bin");
+        fs::write(&file, b"download").unwrap();
+        for (id, status, preview) in [("finished", "completed", false), ("running", "running", false),
+            ("preview", "completed", true)] {
+            store.db.lock().unwrap().execute(
+                "INSERT INTO transfers(id,direction,remote_json,local_path,name,total_bytes,status,created_at,updated_at,repository_preview)
+                 VALUES(?1,'download','{}',?2,'finished.bin',8,?3,0,0,?4)",
+                params![id, file.to_str().unwrap(), status, preview]).unwrap();
+        }
+        assert!(store.remove_completed("running").is_err());
+        assert!(store.remove_completed("preview").is_err());
+        store.remove_completed("finished").unwrap();
+        assert_eq!(store.clear_completed().unwrap(), 0);
+        assert_eq!(fs::read(&file).unwrap(), b"download");
+    }
+
+    #[test]
     fn account_vault_roundtrip_is_encrypted_and_authenticated() {
         let directory = TestDirectory::new();
         let store = Store::new(&directory.0).unwrap();
@@ -388,7 +421,7 @@ mod tests {
         let vault = crate::sessions::Sessions::load(&store).unwrap();
         assert_eq!(vault.accounts.len(), 2);
         assert_eq!(vault.accounts[0].authorization, "old-credential");
-        assert!(vault.active_id.is_none());
+        assert_eq!(vault.active_id.as_deref(), Some("legacy-account"));
         let encrypted = fs::read(directory.0.join("account.vault")).unwrap();
         assert!(!String::from_utf8_lossy(&encrypted).contains("credential"));
     }

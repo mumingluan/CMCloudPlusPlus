@@ -3,8 +3,18 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OperationDialog } from './App';
 import type { CloudFile, FilePage } from './types';
+import type { RepositoryProbe, RepositoryView } from './repositoryApi';
 
-const mocked = vi.hoisted(() => ({ list: vi.fn(), mkdir: vi.fn() }));
+const mocked = vi.hoisted(() => ({ list: vi.fn(), mkdir: vi.fn(), relocate: vi.fn() }));
+const repoMocked = vi.hoisted(() => ({
+  probe: vi.fn(),
+  open: vi.fn(),
+  list: vi.fn(),
+  close: vi.fn(),
+  importFromCloud: vi.fn(),
+  exportToCloud: vi.fn(),
+  relocateBetweenRepositories: vi.fn(),
+}));
 vi.mock('./api', () => ({
   api: mocked,
   native: false,
@@ -14,6 +24,12 @@ vi.mock('./api', () => ({
   watchTransfers: vi.fn(),
   watchScan: vi.fn(),
   watchForeground: vi.fn(),
+}));
+vi.mock('./repositoryApi', () => ({
+  repositoryApi: repoMocked,
+  repositoryDemo: false,
+  repositoryPreviewUrl: (p: string) => p,
+  watchRepositoryDirectory: vi.fn(() => Promise.resolve(() => {})),
 }));
 const directory = (id: string, name: string): CloudFile => ({
   id,
@@ -99,5 +115,192 @@ describe('file operation recovery and request races', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '最新目录' })).toBeTruthy());
     expect(screen.queryByText('过期目录')).toBeNull();
     expect(mocked.list).toHaveBeenCalledTimes(3);
+  });
+
+  it('imports cloud files into a plain repository and disables encrypted repositories', async () => {
+    const plainDir = directory('plain-folder', '普通库');
+    const encDir = directory('enc-folder', '私密库');
+    mocked.list.mockResolvedValue({ files: [plainDir, encDir], nextCursor: null });
+    const probes: Record<string, RepositoryProbe> = {
+      'plain-folder': {
+        folderId: 'plain-folder',
+        repositoryId: 'a'.repeat(32),
+        kind: 'plain',
+        state: 'repository',
+        saved: false,
+      },
+      'enc-folder': {
+        folderId: 'enc-folder',
+        repositoryId: 'b'.repeat(32),
+        kind: 'encrypted',
+        state: 'repository',
+        saved: false,
+      },
+    };
+    repoMocked.open.mockResolvedValue({
+      handle: 'h-plain',
+      repositoryId: 'a'.repeat(32),
+      folderId: 'plain-folder',
+      revision: 'rev-1',
+      encrypted: false,
+      directory: '',
+      items: [],
+      conflicts: [],
+      historical: false,
+      saved: false,
+    } satisfies RepositoryView);
+    repoMocked.list.mockResolvedValue({
+      handle: 'h-plain',
+      repositoryId: 'a'.repeat(32),
+      folderId: 'plain-folder',
+      revision: 'rev-1',
+      encrypted: false,
+      directory: '',
+      items: [
+        {
+          name: '归档目录',
+          path: '归档目录',
+          kind: 'directory',
+          size: 0,
+          conflict: false,
+          protected: false,
+        },
+      ],
+      conflicts: [],
+      historical: false,
+      saved: false,
+    } satisfies RepositoryView);
+    repoMocked.importFromCloud.mockResolvedValue(undefined);
+    repoMocked.close.mockResolvedValue(undefined);
+    const sourceFile: CloudFile = {
+      id: 'f-1',
+      name: 'patch.zip',
+      path: '/root',
+      isDir: false,
+      size: 4096,
+      modifiedAt: '',
+    };
+    const done = vi.fn();
+    const { unmount } = render(
+      <OperationDialog
+        prompt={{ kind: 'move', files: [sourceFile] }}
+        parent={root}
+        root={root}
+        cloudRoot={root}
+        knownProbes={probes}
+        onClose={vi.fn()}
+        onDone={done}
+        alert={vi.fn()}
+      />,
+    );
+    const encBtn = await screen.findByRole('button', { name: /私密库/ });
+    expect(encBtn.hasAttribute('disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /普通库/ }));
+    const subBtn = await screen.findByRole('button', { name: /归档目录/ });
+    repoMocked.list.mockResolvedValueOnce({
+      handle: 'h-plain',
+      repositoryId: 'a'.repeat(32),
+      folderId: 'plain-folder',
+      revision: 'rev-2',
+      encrypted: false,
+      directory: '归档目录',
+      items: [],
+      conflicts: [],
+      historical: false,
+      saved: false,
+    } satisfies RepositoryView);
+    fireEvent.click(subBtn);
+    await waitFor(() =>
+      expect(screen.queryByRole('status')).toBeNull(),
+    );
+    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    await waitFor(() =>
+      expect(repoMocked.importFromCloud).toHaveBeenCalledWith(
+        'h-plain',
+        'rev-2',
+        '归档目录',
+        [sourceFile],
+        false,
+      ),
+    );
+    expect(done).toHaveBeenCalledOnce();
+    unmount();
+    expect(repoMocked.close).toHaveBeenCalledWith('h-plain');
+  });
+
+  it('exports plain repository items out to a Mobile Cloud directory', async () => {
+    const repoRoot: CloudFile = {
+      id: `repository:${'a'.repeat(32)}:`,
+      name: 'x3client-hotfix',
+      path: '',
+      isDir: true,
+      size: 0,
+      modifiedAt: '',
+    };
+    const sourceRepo: RepositoryView = {
+      handle: 'h-src',
+      repositoryId: 'a'.repeat(32),
+      folderId: 'repo-folder',
+      revision: 'rev-src',
+      encrypted: false,
+      directory: '1.7.1300',
+      items: [],
+      conflicts: [],
+      historical: false,
+      saved: false,
+    };
+    const repoOps = {
+      list: vi.fn().mockResolvedValue({ files: [], nextCursor: null }),
+      mkdir: vi.fn(),
+      rename: vi.fn(),
+      remove: vi.fn(),
+      relocate: vi.fn(),
+    };
+    const outFolder = directory('cloud-out', '导出目录');
+    mocked.list
+      .mockResolvedValueOnce({ files: [outFolder], nextCursor: null })
+      .mockResolvedValueOnce({ files: [], nextCursor: null });
+    repoMocked.probe.mockResolvedValue([
+      { folderId: 'cloud-out', repositoryId: null, kind: null, state: 'ordinary', saved: false },
+    ]);
+    repoMocked.exportToCloud.mockResolvedValue(undefined);
+    const repoItem: CloudFile = {
+      id: `repository:${'a'.repeat(32)}:1.7.1300/Total`,
+      name: 'Total',
+      path: '1.7.1300/Total',
+      isDir: true,
+      size: 0,
+      modifiedAt: '',
+    };
+    const done = vi.fn();
+    render(
+      <OperationDialog
+        prompt={{ kind: 'copy', files: [repoItem] }}
+        parent={repoRoot}
+        root={repoRoot}
+        operations={repoOps}
+        sourceRepository={sourceRepo}
+        cloudRoot={root}
+        onClose={vi.fn()}
+        onDone={done}
+        alert={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    fireEvent.click(screen.getByRole('tab', { name: /移动云盘目录/ }));
+    const outBtn = await screen.findByRole('button', { name: /导出目录/ });
+    fireEvent.click(outBtn);
+    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    await waitFor(() =>
+      expect(repoMocked.exportToCloud).toHaveBeenCalledWith(
+        'h-src',
+        'rev-src',
+        ['1.7.1300/Total'],
+        outFolder,
+        true,
+      ),
+    );
+    expect(done).toHaveBeenCalledOnce();
   });
 });

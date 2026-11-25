@@ -18,7 +18,11 @@ $cmUseEncodedRustFlags = $Target -in @('aarch64', 'x86_64') -and -not $env:CARGO
 if ($cmUseEncodedRustFlags) {
     # Tauri sets its own target-specific flags for the initial Cargo invocation.
     # Cargo's encoded flags keep the initial and Gradle-driven link steps equal.
-    $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'link-arg=-Wl,-z,max-page-size=16384', '-C', 'link-arg=-Wl,-z,common-page-size=16384') -join [char]31
+    $cmNativeFlags = @('-C', 'link-arg=-Wl,-z,max-page-size=16384', '-C', 'link-arg=-Wl,-z,common-page-size=16384')
+    # RustCrypto probes the ARM AES capability at runtime and keeps its constant-
+    # time software fallback. This does not require AES on every ARM64 device.
+    if ($Target -eq 'aarch64') { $cmNativeFlags += @('--cfg', 'aes_armv8') }
+    $env:CARGO_ENCODED_RUSTFLAGS = $cmNativeFlags -join [char]31
 }
 Push-Location $cmProjectDirectory
 try {

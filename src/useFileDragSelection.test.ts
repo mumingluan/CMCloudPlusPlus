@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, renderHook } from '@testing-library/react';
 import { useState } from 'react';
-import type { PointerEvent } from 'react';
+import type { MouseEvent, PointerEvent } from 'react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { CloudFile } from './types';
 import { useFileDragSelection } from './useFileDragSelection';
@@ -21,7 +21,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function browser({ count = 3, columns = 1, rowHeight = 48, initial = [] as string[] } = {}) {
+function browser({ count = 3, columns = 1, rowHeight = 48, initial = [] as string[], desktopTouch = false } = {}) {
   const files: CloudFile[] = Array.from({ length: count }, (_, i) => ({
     id: String(i),
     name: `${i}.txt`,
@@ -60,6 +60,7 @@ function browser({ count = 3, columns = 1, rowHeight = 48, initial = [] as strin
           selection,
           onSelection,
           resetKey,
+          desktopTouch,
         }),
         selection,
       };
@@ -147,6 +148,53 @@ it('preserves native touch scrolling and supports checkbox swipe deselection', (
   expect([...h.result.current.selection]).toEqual(['0']);
 });
 
+it('rubber bands upward from desktop blank space with a touch contact', () => {
+  const h = browser({ desktopTouch: true });
+  h.start(60, 220, { pointerType: 'touch' });
+  h.move(140, 70, { pointerType: 'touch', buttons: 0 });
+  expect([...h.result.current.selection]).toEqual(['1', '2']);
+  expect(h.result.current.box).toEqual({ left: 60, top: 70, width: 80, height: 150 });
+  act(() => h.result.current.handlers.onPointerUp(h.pointer(140, 70, { pointerType: 'touch', buttons: 0 })));
+  expect(h.captured.size).toBe(0);
+  expect(h.result.current.box).toBeNull();
+  expect([...h.result.current.selection]).toEqual(['1', '2']);
+});
+
+it('keeps desktop row contacts available to native scrolling', () => {
+  const h = browser({ desktopTouch: true });
+  const row = document.createElement('div');
+  row.className = 'file-row';
+  h.area.append(row);
+  h.start(60, 12, { pointerType: 'touch', target: row });
+  h.move(140, 120, { pointerType: 'touch', target: row });
+  expect(h.result.current.box).toBeNull();
+  expect(h.result.current.selection.size).toBe(0);
+});
+
+it('keeps a touch rectangle when capture transfers from a child surface', () => {
+  const h = browser({ desktopTouch: true });
+  const surface = document.createElement('div');
+  h.area.append(surface);
+  h.start(60, 220, { pointerType: 'touch', target: surface });
+  h.move(140, 70, { pointerType: 'touch', buttons: 0 });
+  act(() => h.result.current.handlers.onLostPointerCapture(h.pointer(140, 70, { target: surface })));
+  expect(h.result.current.box).not.toBeNull();
+  expect(h.captured.has(1)).toBe(true);
+  act(() => h.result.current.handlers.onLostPointerCapture(h.pointer(140, 70)));
+  expect(h.result.current.box).toBeNull();
+  expect(h.captured.size).toBe(0);
+});
+
+it('does not select a last row when a desktop touch rectangle stays in empty grid cells', () => {
+  const h = browser({ desktopTouch: true, count: 4, columns: 3, rowHeight: 152 });
+  h.start(160, 180, { pointerType: 'touch' });
+  h.move(280, 250, { pointerType: 'touch' });
+  expect(h.result.current.selection.size).toBe(0);
+  act(() => h.result.current.handlers.onPointerCancel());
+  expect(h.captured.size).toBe(0);
+  expect(frames.size).toBe(0);
+});
+
 it('cancels pending animation frames when the directory changes', () => {
   const h = browser();
   h.start(60, 220);
@@ -154,4 +202,21 @@ it('cancels pending animation frames when the directory changes', () => {
   h.rerender({ resetKey: 'other-directory' });
   expect(frames.size).toBe(0);
   expect(h.result.current.box).toBeNull();
+});
+
+it('keeps the drag result on release and clears it on the following blank click', () => {
+  const h = browser();
+  h.start(60, 220);
+  h.move(140, 70);
+  act(() => h.result.current.handlers.onPointerUp(h.pointer(140, 70)));
+  const click = {
+    target: h.area,
+    preventDefault: vi.fn(),
+    stopPropagation: vi.fn(),
+  } as unknown as MouseEvent<HTMLDivElement>;
+  act(() => h.result.current.handlers.onClickCapture(click));
+  expect([...h.result.current.selection]).toEqual(['1', '2']);
+  expect(click.preventDefault).toHaveBeenCalledOnce();
+  act(() => h.result.current.handlers.onClickCapture(click));
+  expect([...h.result.current.selection]).toEqual([]);
 });

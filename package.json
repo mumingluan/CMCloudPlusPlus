@@ -1,6 +1,6 @@
 {
   "name": "cmcloud-plus-plus",
-  "version": "0.1.6",
+  "version": "0.1.9",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,8 +16,10 @@
     "@tauri-apps/plugin-dialog": "^2.4.0",
     "@tauri-apps/plugin-opener": "^2.5.0",
     "lucide-react": "^0.468.0",
+    "pdfjs-dist": "6.5.438",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-markdown": "10.1.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.0",

@@ -25,6 +25,7 @@ export function useFileDragSelection({
   selection,
   onSelection,
   resetKey,
+  desktopTouch = false,
 }: {
   scrollRef: RefObject<HTMLDivElement | null>;
   files: CloudFile[];
@@ -33,6 +34,7 @@ export function useFileDragSelection({
   selection: Set<string>;
   onSelection: (selection: Set<string>) => void;
   resetKey: string;
+  desktopTouch?: boolean;
 }) {
   const drag = useRef<Drag | null>(null);
   const frame = useRef(0);
@@ -137,8 +139,12 @@ export function useFileDragSelection({
         const target = event.target as HTMLElement;
         const checkbox = target.closest('.checkbox-wrap');
         if (target.closest('button') && !target.closest('.file-name')) return;
-        // Touch scrolling stays native; start a selection swipe on a checkbox.
-        if (event.pointerType === 'touch' && !checkbox) return;
+        // Desktop blank-space touch is a rubber band. Rows retain native pan;
+        // phones retain their existing scrolling and checkbox swipe behavior.
+        const touchRectangle =
+          desktopTouch && event.pointerType === 'touch' &&
+          !target.closest('.file-row, button, input, label, a, select, textarea');
+        if (event.pointerType === 'touch' && !checkbox && !touchRectangle) return;
         const area = event.currentTarget;
         const bounds = area.getBoundingClientRect();
         if (event.clientX - bounds.left >= area.clientWidth) return;
@@ -161,7 +167,7 @@ export function useFileDragSelection({
             event.ctrlKey || event.metaKey || event.shiftKey || checkbox ? selection : [],
           ),
           active: false,
-          touch: event.pointerType === 'touch' || !!checkbox,
+          touch: !!checkbox,
           startIndex,
           remove: !!files[startIndex] && selection.has(files[startIndex].id),
         };
@@ -197,12 +203,23 @@ export function useFileDragSelection({
         stop();
       },
       onPointerCancel: stop,
-      onLostPointerCapture: stop,
+      onLostPointerCapture: (event: PointerEvent<HTMLDivElement>) => {
+        // A touch initially captures its child target implicitly. Its bubbled
+        // loss when capture moves to this scroll area must not end our drag.
+        if (event.target === event.currentTarget && event.pointerId === drag.current?.pointer) stop();
+      },
       onClickCapture: (event: MouseEvent<HTMLDivElement>) => {
-        if (!suppressClick.current) return;
-        event.preventDefault();
-        event.stopPropagation();
-        suppressClick.current = false;
+        if (suppressClick.current) {
+          event.preventDefault();
+          event.stopPropagation();
+          suppressClick.current = false;
+        } else if (
+          !(event.target as HTMLElement).closest(
+            '.file-row, button, input, label, a, select, textarea',
+          )
+        ) {
+          onSelection(new Set());
+        }
       },
       onDragStart: (event: DragEvent<HTMLDivElement>) => event.preventDefault(),
     },
